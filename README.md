@@ -2,15 +2,38 @@
 
 An external ML inference worker for [Immich](https://immich.app/) that offloads **face detection/recognition**, **CLIP smart search**, and **OCR** to a **Hailo-8** PCIe accelerator. It replaces Immich's built-in ONNX-based ML worker with a FastAPI service that speaks the same `/predict` protocol — but runs inference on the Hailo-8 hardware at a fraction of the power.
 
-## Features
+## Immich Jobs Handled by This Worker
 
-| Feature | Models | Status |
-|---------|--------|--------|
-| Face detection | SCRFD 2.5G | Working |
-| Face recognition | ArcFace R50 | Working |
-| Smart search (image) | TinyCLIP ViT-39M/16 | Working |
-| Smart search (text) | TinyCLIP ViT-39M/16 | Working |
-| OCR (text extraction) | PaddleOCR v5 mobile | Working |
+This worker accelerates the following Immich jobs on the Hailo-8:
+
+| Immich Job | Hailo Model | Notes |
+|------------|-------------|-------|
+| **Smart Search** | TinyCLIP ViT-39M/16 **or** SigLIP B/16 | CLIP image embeddings for semantic search |
+| **Duplicate Detection** | (uses Smart Search embeddings) | No separate inference — reuses CLIP embeddings |
+| **Face Detection** | SCRFD 2.5G | Detects faces in images |
+| **Facial Recognition** | ArcFace R50 | Generates face embeddings for grouping people |
+| **OCR** | PaddleOCR v5 mobile | Extracts text from images |
+
+Other Immich jobs (Generate Thumbnails, Extract Metadata, Transcode Videos, Sidecar Metadata, External Libraries, Storage Template Migration) run on the Immich server itself and are not affected by this worker.
+
+### CLIP Backend Choice
+
+Two CLIP backends are available, selectable via the `CLIP_BACKEND` environment variable:
+
+|  | TinyCLIP (default) | SigLIP |
+|--|-------------------|--------|
+| Image input | 224x224 (center-crop) | 224x224 (squash resize) |
+| Embedding dim | 512 | 768 |
+| Image FPS | ~60 | ~14 |
+| Text FPS | ~18 | ~17 |
+| Search quality | Good | Better |
+| Immich model match | None | `ViT-B-16-SigLIP__webli` |
+
+**TinyCLIP** is significantly faster (~4x for images) but produces embeddings incompatible with any Immich default model.
+
+**SigLIP** produces the same embeddings as Immich's `ViT-B-16-SigLIP__webli` (same underlying Google model weights). This means you can switch between this Hailo worker and the official Immich ML worker **without re-running Smart Search** — the embeddings are compatible. The text encoder output is also simpler: already pooled to a single vector (no CPU-side projection needed).
+
+Both backends output UINT16 from the Hailo device and are dequantized to float32 before L2 normalization.
 
 ## Prerequisites
 
@@ -98,12 +121,30 @@ curl -Lo models/paddle_ocr_v5_mobile_recognition.hef \
   https://hailo-model-zoo.s3.eu-west-2.amazonaws.com/ModelZoo/Compiled/v2.18.0/hailo8/paddle_ocr_v5_mobile_recognition.hef
 ```
 
+**SigLIP Image Encoder** ([model card](https://github.com/hailo-ai/hailo_model_zoo/blob/master/docs/public_models/HAILO8/HAILO8_zero_shot_classification.rst)) — only needed for SigLIP backend:
+```bash
+curl -Lo models/siglip_b_16_image_encoder.hef \
+  https://hailo-model-zoo.s3.eu-west-2.amazonaws.com/ModelZoo/Compiled/v2.18.0/hailo8/siglip_b_16_image_encoder.hef
+```
+
+**SigLIP Text Encoder** ([model card](https://github.com/hailo-ai/hailo_model_zoo/blob/master/docs/public_models/HAILO8/HAILO8_text_image_retrieval.rst)) — only needed for SigLIP backend:
+```bash
+curl -Lo models/siglip_b_16_text_encoder.hef \
+  https://hailo-model-zoo.s3.eu-west-2.amazonaws.com/ModelZoo/Compiled/v2.18.0/hailo8/siglip_b_16_text_encoder.hef
+```
+
 ### Step 2: Download Supporting Files
 
-**CLIP BPE Tokenizer Vocabulary** (from [OpenAI CLIP](https://github.com/mlfoundations/open_clip/blob/main/src/open_clip/bpe_simple_vocab_16e6.txt.gz)):
+**CLIP BPE Tokenizer Vocabulary** (TinyCLIP only, from [OpenAI CLIP](https://github.com/mlfoundations/open_clip/blob/main/src/open_clip/bpe_simple_vocab_16e6.txt.gz)):
 ```bash
 curl -Lo models/bpe_simple_vocab_16e6.txt.gz \
   https://github.com/openai/CLIP/raw/main/clip/bpe_simple_vocab_16e6.txt.gz
+```
+
+**SentencePiece Tokenizer Model** (SigLIP only, from [google/siglip-base-patch16-224](https://huggingface.co/google/siglip-base-patch16-224)):
+```bash
+curl -Lo models/spiece.model \
+  https://huggingface.co/google/siglip-base-patch16-224/resolve/main/spiece.model
 ```
 
 **OCR Character Dictionary** (from [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR/blob/main/ppocr/utils/dict/ppocrv5_dict.txt) — 18,383 characters covering CJK, Latin, Cyrillic, symbols, and emoji):
@@ -124,17 +165,23 @@ docker build -t immich-ml-hailo:v4.23.0 -f Dockerfile.immich-ml-hailo .
 
 > On ARM64, the base image build automatically detects the platform. If you need to cross-build, pass `--build-arg DEB_ARCH=arm64 --build-arg WHL_ARCH=aarch64`.
 
-### Step 4: Extract TinyCLIP Text Weights
+### Step 4: Extract CLIP Text Weights
 
-The CLIP text encoder needs CPU-side embedding weights extracted from the original TinyCLIP model checkpoint:
+The CLIP text encoder needs CPU-side embedding weights extracted from the original model. Run the script for your chosen backend:
 
+**TinyCLIP:**
 ```bash
 ./scripts/extract_tinyclip_weights.sh
+# Downloads TinyCLIP checkpoint (~330MB), saves models/tinyclip_text_weights.npz
 ```
 
-This downloads the TinyCLIP checkpoint (~330MB), extracts the token embeddings, positional embeddings, and text projection matrix, and saves them to `models/tinyclip_text_weights.npz`. Only needs to be done once.
+**SigLIP:**
+```bash
+./scripts/extract_siglip_weights.sh
+# Downloads SigLIP model (~813MB), saves models/siglip_text_weights.npz + models/spiece.model
+```
 
-> If you already have `models/tinyclip_text_weights.npz`, skip this step.
+Only needs to be done once per backend.
 
 ## Running
 
@@ -145,6 +192,7 @@ docker run -d \
   --device=/dev/hailo0:/dev/hailo0 \
   --group-add=0 \
   --publish 3003:3003 \
+  -e CLIP_BACKEND=siglip \
   --name immich-ml-hailo \
   --restart unless-stopped \
   immich-ml-hailo:v4.23.0
@@ -152,7 +200,37 @@ docker run -d \
 
 > **Note on `--group-add=0`:** This grants the container process access to the root group (GID 0), which typically owns `/dev/hailo0`. It may not be required on all systems (e.g., Unraid works without it), but is safe to include.
 
-Then configure Immich to use this worker by setting the **Machine Learning URL** to `http://<host-ip>:3003` in the Immich admin settings.
+## Immich Configuration
+
+In the Immich **Admin Settings → Machine Learning**:
+
+**Required:**
+- Set **Machine Learning URL** to `http://<hailo-host-ip>:3003`
+
+**Model names — leave as default:**
+
+The model name dropdowns (CLIP model, Facial recognition model, OCR model) can be left at their defaults. This worker ignores the model names — it always uses the Hailo-accelerated models regardless of what's selected. The names are sent with each request but have no effect.
+
+**Score thresholds — these work normally:**
+
+All threshold settings (minimum detection score, maximum recognition distance, minimum recognized faces, OCR confidence scores, etc.) are sent with each request and respected by this worker. Adjust them as you normally would.
+
+**CLIP backend (`CLIP_BACKEND` env var):**
+
+Both CLIP backends are included in every Docker image. You switch between them by setting the `CLIP_BACKEND` environment variable at container startup — no rebuild needed:
+
+```bash
+# Use SigLIP (better quality, Immich-compatible)
+docker run -e CLIP_BACKEND=siglip ...
+
+# Use TinyCLIP (faster, default)
+docker run -e CLIP_BACKEND=tinyclip ...
+```
+
+- **SigLIP** (`CLIP_BACKEND=siglip`): Embeddings are compatible with Immich's `ViT-B-16-SigLIP__webli`. You can switch between this Hailo worker and the official Immich ML worker (with the same CLIP model selected in Immich) **without re-running Smart Search**.
+- **TinyCLIP** (`CLIP_BACKEND=tinyclip`): Embeddings are not compatible with any of Immich's available CLIP models (`ViT-SO400M-16-SigLIP2-384__webli`, `ViT-B-16-SigLIP2__webli`, `ViT-B-16-SigLIP__webli`, `ViT-B-32__laion2b-s34b-b79k`). Switching to/from the official ML worker requires re-running Smart Search.
+
+> **Note:** Changing `CLIP_BACKEND` between TinyCLIP and SigLIP also requires re-running Smart Search, since the embedding dimensions differ (512 vs 768).
 
 ## Testing
 

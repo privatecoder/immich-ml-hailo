@@ -198,6 +198,8 @@ docker run -d \
   immich-ml-hailo:v4.23.0
 ```
 
+Set `CLIP_BACKEND` to `siglip` or `tinyclip` (see [CLIP Backend Choice](#clip-backend-choice) for details). Both are included in the image — change the value and restart the container to switch, no rebuild needed.
+
 > **Note on `--group-add=0`:** This grants the container process access to the root group (GID 0), which typically owns `/dev/hailo0`. It may not be required on all systems (e.g., Unraid works without it), but is safe to include.
 
 ## Immich Configuration

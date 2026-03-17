@@ -1,0 +1,28 @@
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+
+ARG HAILORT_VERSION=4.23.0
+ARG DEB_ARCH=amd64
+ARG WHL_ARCH=x86_64
+
+RUN apt-get update && apt-get install -y \
+    python3-pip python3-dev python3-netifaces \
+    build-essential pciutils \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY hailo-rt-4/hailort* /tmp/
+
+RUN dpkg-deb -x /tmp/hailort_${HAILORT_VERSION}_${DEB_ARCH}.deb / \
+    && rm /tmp/hailort_${HAILORT_VERSION}_${DEB_ARCH}.deb \
+    && ldconfig
+
+RUN pip3 install --break-system-packages --no-deps /tmp/hailort-${HAILORT_VERSION}-cp312-cp312-linux_${WHL_ARCH}.whl \
+    && pip3 install --break-system-packages argcomplete contextlib2 future netaddr "numpy<2" \
+    && rm /tmp/hailort-${HAILORT_VERSION}-cp312-cp312-linux_${WHL_ARCH}.whl
+
+# Remove build tools no longer needed at runtime
+RUN apt-get purge -y --auto-remove build-essential python3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+CMD ["bash"]

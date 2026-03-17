@@ -1,0 +1,28 @@
+FROM hailo-base:v4.23.0
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3-venv \
+    ffmpeg \
+    libglib2.0-0 libsm6 libxext6 libxrender1 \
+    python3-opencv \
+    nano wget curl jq \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip3 install --break-system-packages \
+    fastapi uvicorn[standard] python-multipart pillow requests \
+    pyclipper shapely
+
+WORKDIR /app
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app
+
+COPY ml_target/ ml_target/
+COPY models/ models/
+
+EXPOSE 3003
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD curl -sf http://localhost:3003/ping || exit 1
+
+CMD ["python3", "-m", "uvicorn", "ml_target.app:app", "--host", "0.0.0.0", "--port", "3003"]

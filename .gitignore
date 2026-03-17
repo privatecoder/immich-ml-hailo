@@ -1,0 +1,14 @@
+.DS_Store
+__pycache__/
+*.pyc
+*.pyo
+
+# Private / copyrighted files — not for publishing
+CLAUDE.md
+docs/
+
+# Keep directories but ignore contents (downloaded by user per README)
+hailo-rt-4/*
+!hailo-rt-4/.gitkeep
+models/*
+!models/.gitkeep

@@ -52,10 +52,31 @@ $*
 
 # ── preflight ─────────────────────────────────────────────────────────
 
+# Which CLIP backend is the service running? test.sh executes inside the
+# container via `docker exec`, which inherits the environment the container was
+# started with, so CLIP_BACKEND is readable here. Resolution mirrors
+# ml_target/config.py and pipeline.py exactly: lowercased, and anything that is
+# not "siglip" falls back to tinyclip.
+#
+# This matters: asserting "512 or 768" would let a SigLIP run that silently fell
+# back to TinyCLIP pass the whole suite.
+CLIP_BACKEND_RAW="${CLIP_BACKEND:-tinyclip}"
+CLIP_BACKEND=$(printf '%s' "$CLIP_BACKEND_RAW" | tr '[:upper:]' '[:lower:]')
+if [[ "$CLIP_BACKEND" == "siglip" ]]; then
+    CLIP_DIM=768
+else
+    CLIP_DIM=512
+fi
+
 echo ""
 bold "=== immich-ml-hailo test suite ==="; echo ""
-echo "Target: $BASE_URL"
-echo "Image:  $IMAGE"
+echo "Target:  $BASE_URL"
+echo "Image:   $IMAGE"
+echo "Backend: $CLIP_BACKEND (expecting ${CLIP_DIM}-dim CLIP embeddings)"
+if [[ "$CLIP_BACKEND" != "tinyclip" && "$CLIP_BACKEND" != "siglip" ]]; then
+    echo "  $(yellow NOTE): CLIP_BACKEND='$CLIP_BACKEND_RAW' is not a recognized backend."
+    echo "        The service falls back to tinyclip, so 512 dims are expected."
+fi
 echo ""
 
 if [[ ! -f "$IMAGE" ]]; then
@@ -67,7 +88,8 @@ fi
 if ! curl -sf "$BASE_URL/ping" >/dev/null 2>&1; then
     echo "$(red ERROR): Service not reachable at $BASE_URL/ping"
     echo "Start the container first:"
-    echo "  docker run -itd --device=/dev/hailo0:/dev/hailo0 --group-add=0 -p 3003:3003 immich-ml-hailo:v4.23.0"
+    echo "  docker run -itd --device=/dev/hailo0:/dev/hailo0 --group-add=0 -p 3003:3003 immich-ml-hailo:v<hailort-version>"
+    echo "  (the tag matches the HailoRT version the image was built with, e.g. v4.24.0)"
     exit 1
 fi
 
@@ -102,9 +124,9 @@ check "response has clip key" "$R" "
 assert 'clip' in r, f'missing clip key: {list(r.keys())}'
 "
 
-check "clip is 512-dim embedding" "$R" "
+check "clip is ${CLIP_DIM}-dim embedding ($CLIP_BACKEND)" "$R" "
 emb = json.loads(r['clip'])
-assert isinstance(emb, list) and len(emb) == 512, f'expected 512-dim, got {len(emb)}'
+assert isinstance(emb, list) and len(emb) == $CLIP_DIM, f'$CLIP_BACKEND expects $CLIP_DIM-dim, got {len(emb)}'
 "
 
 check "imageHeight and imageWidth present" "$R" "
@@ -125,9 +147,9 @@ check "response has clip key" "$R" "
 assert 'clip' in r, f'missing clip key: {list(r.keys())}'
 "
 
-check "clip is 512-dim embedding" "$R" "
+check "clip is ${CLIP_DIM}-dim embedding ($CLIP_BACKEND)" "$R" "
 emb = json.loads(r['clip'])
-assert isinstance(emb, list) and len(emb) == 512, f'expected 512-dim, got {len(emb)}'
+assert isinstance(emb, list) and len(emb) == $CLIP_DIM, f'$CLIP_BACKEND expects $CLIP_DIM-dim, got {len(emb)}'
 "
 
 check "no imageHeight/imageWidth for text-only" "$R" "
@@ -198,7 +220,8 @@ for f in r['facial-recognition']:
         assert k in bb, f'missing {k} in boundingBox'
     assert 'score' in f and 0 <= f['score'] <= 1, f'bad score: {f.get(\"score\")}'
     emb = json.loads(f['embedding'])
-    assert len(emb) == 512, f'expected 512-dim embedding, got {len(emb)}'
+    # ArcFace R50 is always 512-dim — independent of the CLIP backend.
+    assert len(emb) == 512, f'expected 512-dim face embedding, got {len(emb)}'
 "
 else
     skip "no faces detected in test image — face structure checks skipped"
@@ -264,9 +287,9 @@ assert 'facial-recognition' in r, f'missing facial-recognition: {list(r.keys())}
 assert 'clip' in r, f'missing clip: {list(r.keys())}'
 "
 
-check "clip embedding is valid" "$R" "
+check "clip embedding is valid (${CLIP_DIM}-dim, $CLIP_BACKEND)" "$R" "
 emb = json.loads(r['clip'])
-assert len(emb) == 512
+assert len(emb) == $CLIP_DIM, f'$CLIP_BACKEND expects $CLIP_DIM-dim, got {len(emb)}'
 "
 
 # ── Test 9: Error handling ────────────────────────────────────────────

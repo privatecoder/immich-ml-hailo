@@ -11,7 +11,10 @@
 # for loading the checkpoint — no GPU required.
 #
 # Usage:
-#   ./scripts/extract_tinyclip_weights.sh
+#   HAILORT_VERSION=<ver> ./scripts/extract_tinyclip_weights.sh
+#
+# HAILORT_VERSION is required — it selects the hailo-base image to run in.
+# setup.sh exports it; a standalone run must pass it.
 #
 # Output:
 #   models/tinyclip_text_weights.npz
@@ -22,7 +25,22 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 OUTPUT="$PROJECT_DIR/models/tinyclip_text_weights.npz"
 CONTAINER_NAME="tinyclip-extract-$$"
-IMAGE="hailo-base:v4.23.0"
+
+# Required, no default. This selects which hailo-base image the extraction runs
+# in; defaulting would silently reach for a stale base image when this script is
+# run on its own (setup.sh exports the variable, but a fresh shell does not).
+if [[ -z "${HAILORT_VERSION:-}" ]]; then
+    echo "ERROR: HAILORT_VERSION is required — there is no default."
+    echo ""
+    echo "  It selects the hailo-base image this extraction runs in, and must"
+    echo "  match the hailo_pci kernel module on this host:"
+    echo ""
+    echo "    modinfo hailo_pci | grep '^version:'"
+    echo ""
+    echo "  Then re-run:  HAILORT_VERSION=4.24.0 $0"
+    exit 1
+fi
+IMAGE="hailo-base:v${HAILORT_VERSION}"
 CHECKPOINT_URL="https://github.com/wkcn/TinyCLIP-model-zoo/releases/download/checkpoints/TinyCLIP-ViT-39M-16-Text-19M-YFCC15M.pt"
 
 echo "=== Extract TinyCLIP text weights ==="
@@ -34,7 +52,7 @@ echo ""
 # Check that base image exists
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
     echo "ERROR: Docker image '$IMAGE' not found."
-    echo "Build it first: docker build -t hailo-base:v4.23.0 -f Dockerfile.hailo-base ."
+    echo "Build it first: docker build --build-arg HAILORT_VERSION=$HAILORT_VERSION -t $IMAGE -f Dockerfile.hailo-base ."
     exit 1
 fi
 

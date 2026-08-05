@@ -86,8 +86,8 @@ def crop_and_resize_rgb(
     return resize_rgb(crop, out_size, out_size)
 
 
-def prep_clip_image(img_rgb_u8: np.ndarray, crop_size: int, input_format) -> np.ndarray:
-    """Preprocess an image for CLIP visual encoder."""
+def prep_tinyclip_image(img_rgb_u8: np.ndarray, crop_size: int, input_format) -> np.ndarray:
+    """Preprocess an image for TinyCLIP visual encoder (center-crop)."""
     import hailo_platform as hpf
 
     img = center_crop_square(img_rgb_u8, crop_size)
@@ -102,20 +102,42 @@ def prep_clip_image(img_rgb_u8: np.ndarray, crop_size: int, input_format) -> np.
     return np.ascontiguousarray(x[None, ...], dtype=np.float32)
 
 
+def prep_siglip_image(img_rgb_u8: np.ndarray, crop_size: int) -> np.ndarray:
+    """Preprocess an image for SigLIP visual encoder (squash resize, UINT8).
+
+    SigLIP uses squash resize (not center-crop). Normalization is baked into the HEF.
+    """
+    img = resize_rgb(img_rgb_u8, crop_size, crop_size)
+    return np.ascontiguousarray(img[None, ...], dtype=np.uint8)
+
+
 def prep_clip_text_input(
-    token_ids_77: np.ndarray,
+    token_ids: np.ndarray,
     token_embedding: np.ndarray,
     positional_embedding: np.ndarray,
     qp_scale: float,
     qp_zp: float,
 ) -> np.ndarray:
-    """Pack token embeddings into quantized UINT16 input for text encoder HEF."""
-    if token_ids_77.shape != (77,):
-        raise ValueError(f"token_ids must be (77,), got {token_ids_77.shape}")
+    """Pack token embeddings into quantized UINT16 input for a CLIP/SigLIP text encoder HEF.
 
-    x = token_embedding[token_ids_77] + positional_embedding  # (77, 512) float32
+    Works for both TinyCLIP (77 tokens, 512-dim) and SigLIP (64 tokens, 768-dim).
+    """
+    ctx_len = token_ids.shape[0]
+    embed_dim = token_embedding.shape[1]
+
+    x = token_embedding[token_ids] + positional_embedding[:ctx_len]  # (ctx_len, embed_dim)
     x_u16 = np.clip(np.round(x / qp_scale + qp_zp), 0, 65535).astype(np.uint16)
-    return np.ascontiguousarray(x_u16[None, None, ...], dtype=np.uint16)
+
+    # TinyCLIP expects (1, 1, 77, 512), SigLIP expects (1, 64, 768)
+    if embed_dim == 512:
+        return np.ascontiguousarray(x_u16[None, None, ...], dtype=np.uint16)
+    else:
+        return np.ascontiguousarray(x_u16[None, ...], dtype=np.uint16)
+
+
+def dequantize_uint16(x: np.ndarray, qp_scale: float, qp_zp: float) -> np.ndarray:
+    """Dequantize UINT16 tensor to float32: float32 = (uint16 - zp) * scale."""
+    return (x.astype(np.float32) - qp_zp) * qp_scale
 
 
 def l2_normalize(v: np.ndarray) -> np.ndarray:

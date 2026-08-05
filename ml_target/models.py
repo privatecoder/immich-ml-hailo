@@ -26,6 +26,20 @@ import hailo_platform as hpf
 LOG = logging.getLogger("ml_target.models")
 
 
+@dataclass(frozen=True)
+class QuantParams:
+    """Quantization parameters for one vstream, as baked into a HEF.
+
+    These describe a specific *compilation*, not the model architecture: a
+    Hailo-8 and a Hailo-8L build of the same network generally carry different
+    values. Applying the wrong ones does not raise — it silently yields subtly
+    wrong numbers — which is why they are read from the HEF rather than
+    hardcoded.
+    """
+    qp_scale: float
+    qp_zp: float
+
+
 @dataclass
 class HailoModel:
     """Wraps a configured Hailo network group with its vstream parameters."""
@@ -37,6 +51,10 @@ class HailoModel:
     in_key: str
     input_format: hpf.FormatType
     output_format: hpf.FormatType
+    # Read from the HEF when this HailoRT exposes them; None otherwise, in which
+    # case callers fall back to the constants in config.py.
+    input_quant: Optional[QuantParams] = None
+    output_quant: Optional[QuantParams] = None
 
 
 def configure_model(
@@ -64,9 +82,13 @@ def configure_model(
     in_key = next(iter(in_params.keys()))
     name = in_key.split("/")[0] if "/" in in_key else in_key
 
+    input_quant = _read_stream_quant(hef, "input", hef_path)
+    output_quant = _read_stream_quant(hef, "output", hef_path)
+
     LOG.info("Configured model: %s", hef_path)
     LOG.info("  in_key=%s  out_keys=%s", in_key, list(out_params.keys()))
     LOG.info("  in_format=%s  out_format=%s", input_format, output_format)
+    LOG.info("  in_quant=%s  out_quant=%s", _fmt_quant(input_quant), _fmt_quant(output_quant))
 
     return HailoModel(
         name=name,
@@ -77,7 +99,54 @@ def configure_model(
         in_key=in_key,
         input_format=input_format,
         output_format=output_format,
+        input_quant=input_quant,
+        output_quant=output_quant,
     )
+
+
+def _read_quant(info: Any) -> Optional[QuantParams]:
+    """Extract quantization params from one vstream info, or None.
+
+    Every access is guarded: the attribute name has varied across HailoRT
+    versions, and a runtime that does not expose it must degrade to None rather
+    than break model configuration.
+    """
+    try:
+        quant = getattr(info, "quant_info", None)
+        if quant is None:
+            return None
+        scale = getattr(quant, "qp_scale", None)
+        zp = getattr(quant, "qp_zp", None)
+        if scale is None or zp is None:
+            return None
+        return QuantParams(float(scale), float(zp))
+    except Exception:
+        return None
+
+
+def _read_stream_quant(hef: hpf.HEF, which: str, hef_path: str) -> Optional[QuantParams]:
+    """Read quant params for a HEF's single input or output vstream.
+
+    Returns None when the runtime does not expose quantization info, or when the
+    HEF has multiple streams of that kind — SCRFD has six outputs, and there is
+    no single set of params to attribute to the model. Those models all request
+    FLOAT32 output, so HailoRT dequantizes on-device and the values are unused.
+    """
+    try:
+        infos = (hef.get_input_vstream_infos() if which == "input"
+                 else hef.get_output_vstream_infos())
+        if not infos or len(infos) != 1:
+            return None
+        return _read_quant(infos[0])
+    except Exception as exc:
+        LOG.warning("Could not read %s quantization info from %s: %s", which, hef_path, exc)
+        return None
+
+
+def _fmt_quant(q: Optional[QuantParams]) -> str:
+    if q is None:
+        return "<none>"
+    return f"scale={q.qp_scale:.17g} zp={q.qp_zp:.17g}"
 
 
 def _guess_input_format(hef: hpf.HEF) -> hpf.FormatType:

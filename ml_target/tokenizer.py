@@ -1,4 +1,4 @@
-"""OpenAI CLIP BPE tokenizer reimplemented with stdlib `re` only (no `regex` dep)."""
+"""Tokenizers for CLIP text encoding: BPE (TinyCLIP) and SentencePiece (SigLIP)."""
 
 import gzip
 import re
@@ -131,3 +131,38 @@ class SimpleTokenizer:
         else:
             tokens = tokens + [0] * (context_length - len(tokens))
         return np.array(tokens, dtype=np.int32)
+
+
+class SiglipTokenizer:
+    """SigLIP SentencePiece tokenizer (google/siglip-base-patch16-224).
+
+    Lowercases text, strips punctuation, encodes with SentencePiece,
+    appends EOS, and pads with pad_token_id to context_length.
+    """
+
+    def __init__(self, spiece_model_path: str, pad_token_id: int = 1):
+        import sentencepiece as spm
+        self.sp = spm.SentencePieceProcessor()
+        self.sp.Load(spiece_model_path)
+        self.pad_token_id = pad_token_id
+        self.eos_token_id = pad_token_id  # SigLIP uses </s> (id=1) as both EOS and pad
+        # Punctuation removal pattern (matches SigLIP's preprocessing)
+        self._punct_re = re.compile(r"[!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~]")
+
+    def tokenize(self, text: str, context_length: int = 64) -> np.ndarray:
+        # SigLIP preprocessing: lowercase, strip punctuation, collapse whitespace
+        text = text.strip().lower()
+        text = self._punct_re.sub("", text)
+        text = re.sub(r"\s+", " ", text).strip()
+
+        token_ids = self.sp.Encode(text)
+
+        # Append EOS, truncate to context_length
+        token_ids = token_ids + [self.eos_token_id]
+        if len(token_ids) > context_length:
+            token_ids = token_ids[:context_length]
+
+        # Pad with pad_token_id
+        token_ids = token_ids + [self.pad_token_id] * (context_length - len(token_ids))
+
+        return np.array(token_ids, dtype=np.int32)

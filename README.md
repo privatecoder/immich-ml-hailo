@@ -33,13 +33,36 @@ Two CLIP backends are available, selectable via the `CLIP_BACKEND` environment v
 
 **SigLIP** produces the same embeddings as Immich's `ViT-B-16-SigLIP__webli` (same underlying Google model weights). This means you can switch between this Hailo worker and the official Immich ML worker **without re-running Smart Search** — the embeddings are compatible. The text encoder output is also simpler: already pooled to a single vector (no CPU-side projection needed).
 
-Both backends output UINT16 from the Hailo device and are dequantized to float32 before L2 normalization.
+The two backends come off the device differently. **TinyCLIP** outputs FLOAT32 directly — no dequantization step. **SigLIP** outputs UINT16 and is dequantized to float32 using per-model quantization parameters (`output_qp_scale` / `output_qp_zp` in `config.py`). Both are L2-normalized before being returned.
 
 ## Prerequisites
 
-- **Hailo-8 or Hailo-8L** M.2 PCIe accelerator
-- **Host Hailo drivers** installed and working (HailoRT v4.23.0). For Unraid, use the `Hailo RT Driver` app by ich777. See [hailort-drivers](https://github.com/hailo-ai/hailort-drivers) (v4 branch for Hailo-8/8L, v5 for Hailo-10H/15H).
+- **Hailo-8** M.2 PCIe accelerator — the tested configuration. **Hailo-8L** is supported via [documented model substitution](#hailo-8l-model-substitution), but has not been verified on hardware.
+- **Host Hailo drivers** installed and working. For Unraid, use the `Hailo RT Driver` app by ich777. See [hailort-drivers](https://github.com/hailo-ai/hailort-drivers) (v4 branch for Hailo-8/8L, v5 for Hailo-10H/15H).
 - **Docker** on the host
+
+### ⚠️ HailoRT version must match the host driver exactly
+
+The HailoRT library inside the container and the `hailo_pci` kernel module on the host must be the **same version**. Any difference — even a patch bump — makes the container fail at startup with:
+
+```
+CHECK failed - Driver version (X) is different from library version (Y)
+HAILO_INVALID_DRIVER_VERSION(76)
+```
+
+Find your host's version first, and use it everywhere below:
+
+```bash
+modinfo hailo_pci | grep '^version:'
+# or
+cat /sys/module/hailo_pci/version
+```
+
+Read the **kernel module** version. Do not use `hailortcli fw-control identify` — it reports board/firmware identity and the CLI's own HailoRT version, not the driver's.
+
+> **Unraid users:** the ich777 `Hailo RT Driver` plugin updates the driver on its own schedule, and an Unraid OS update can move it too. A driver bump breaks a previously working container. After any Unraid or plugin update, re-check `modinfo hailo_pci` and rebuild the images if the version changed. There is no `apt-mark hold` equivalent on Unraid.
+
+The examples in this README use `4.24.0`. **Substitute your host's actual version.**
 
 ## Download HailoRT Packages (required for both Quick and Manual Setup)
 
@@ -55,27 +78,33 @@ Go to [Software Downloads](https://hailo.ai/developer-zone/software-downloads/?p
 | OS | Linux |
 | Python Version | 3.12 |
 
-Download the two files for your platform and place them in `hailo-rt-4/`:
+Pick the **version that matches your host driver** (see above), then download the two files for your platform and place them in `hailo-rt-4/`. Keep the filenames exactly as downloaded — the build looks them up by name.
 
 **x86_64:**
-- _HailoRT – Python package (whl) for Python 3.12, x86_64_ → `hailort-4.23.0-cp312-cp312-linux_x86_64.whl`
-- _HailoRT – Ubuntu package (deb) for amd64_ → `hailort_4.23.0_amd64.deb`
+- _HailoRT – Python package (whl) for Python 3.12, x86_64_ → `hailort-<version>-cp312-cp312-linux_x86_64.whl`
+- _HailoRT – Ubuntu package (deb) for amd64_ → `hailort_<version>_amd64.deb`
 
 **ARM64 (aarch64):**
-- _HailoRT – Python package (whl) for Python 3.12, aarch64_ → `hailort-4.23.0-cp312-cp312-linux_aarch64.whl`
-- _HailoRT – Ubuntu package (deb) for arm64_ → `hailort_4.23.0_arm64.deb`
+- _HailoRT – Python package (whl) for Python 3.12, aarch64_ → `hailort-<version>-cp312-cp312-linux_aarch64.whl`
+- _HailoRT – Ubuntu package (deb) for arm64_ → `hailort_<version>_arm64.deb`
 
-> **Why Python 3.12?** The Docker base image uses Ubuntu 24.04 LTS, which ships Python 3.12 as the system default. HailoRT 4.23.0 supports Python 3.10, 3.11, and 3.12 — using the system Python avoids managing a venv, and 3.12 has the best performance (~5% faster runtime than 3.11).
+For example, on an x86_64 host running driver 4.24.0: `hailort-4.24.0-cp312-cp312-linux_x86_64.whl` and `hailort_4.24.0_amd64.deb`.
+
+> **Why Python 3.12?** The Docker base image uses Ubuntu 24.04 LTS, which ships Python 3.12 as the system default. HailoRT 4.x supports Python 3.10, 3.11, and 3.12 — using the system Python avoids managing a venv, and 3.12 has the best performance (~5% faster runtime than 3.11).
 
 ## Quick Setup
 
 Once the HailoRT packages are in `hailo-rt-4/`, run:
 
 ```bash
-./setup.sh
+HAILORT_VERSION=4.24.0 ./setup.sh
 ```
 
-This will check for required files, offer to download missing models, build both Docker images, extract TinyCLIP weights, and run the test suite. See the [Manual Setup](#manual-setup) section below if you prefer to do each step yourself.
+Set `HAILORT_VERSION` to your host driver's version. It is threaded through both Docker builds, both weight-extraction scripts, and the image tags, so a future driver bump is a one-variable change.
+
+**`HAILORT_VERSION` is required — there is no default.** A bare `./setup.sh` aborts immediately and prints the `modinfo` command to find your host's version. Guessing would build and tag cleanly, then fail at runtime with `HAILO_INVALID_DRIVER_VERSION(76)`, which is precisely the failure this is meant to prevent.
+
+This will check for required files, offer to download missing models, build both Docker images, extract the CLIP text weights for both backends, and run the test suite against both. See the [Manual Setup](#manual-setup) section below if you prefer to do each step yourself.
 
 ## Manual Setup
 
@@ -83,7 +112,7 @@ This will check for required files, offer to download missing models, build both
 
 Download the pre-compiled `.hef` model files from the [Hailo Model Zoo](https://github.com/hailo-ai/hailo_model_zoo/tree/master/docs/public_models) and place them in `models/`.
 
-These links are for **Hailo-8** accelerators and may not work on **Hailo-8L** cards.
+The `curl` commands below are for **Hailo-8**. For **Hailo-8L**, see [Hailo-8L model substitution](#hailo-8l-model-substitution) at the end of this step — the URLs differ, and the SCRFD output layer names in `config.py` must be re-derived from your own HEF.
 
 **Face Detection** ([model card](https://github.com/hailo-ai/hailo_model_zoo/blob/master/docs/public_models/HAILO8/HAILO8_face_detection.rst)):
 ```bash
@@ -133,6 +162,70 @@ curl -Lo models/siglip_b_16_text_encoder.hef \
   https://hailo-model-zoo.s3.eu-west-2.amazonaws.com/ModelZoo/Compiled/v2.18.0/hailo8/siglip_b_16_text_encoder.hef
 ```
 
+#### Hailo-8L model substitution
+
+**Quick Setup does not work for Hailo-8L.** `setup.sh` hardcodes the Hailo-8 URLs in `HEF_BASE` and `HEF_V218` (`setup.sh:65-66`), so an 8L card requires this Manual Setup path.
+
+All eight models are available for Hailo-8L under a **single** prefix:
+
+```
+https://hailo-model-zoo.s3.eu-west-2.amazonaws.com/ModelZoo/Compiled/v2.18.0/hailo8l/
+```
+
+This is simpler than the Hailo-8 path above, which straddles two Model Zoo releases — v2.17.0 for SCRFD, ArcFace, and TinyCLIP; v2.18.0 for SigLIP and OCR. For 8L, take everything from **v2.18.0/hailo8l**; v2.17.0 does not carry TinyCLIP for that device.
+
+```bash
+HEF_8L="https://hailo-model-zoo.s3.eu-west-2.amazonaws.com/ModelZoo/Compiled/v2.18.0/hailo8l"
+
+for m in scrfd_2.5g arcface_r50 \
+         tinyclip_vit_39m_16_text_19m_yfcc15m_image_encoder \
+         tinyclip_vit_39m_16_text_19m_yfcc15m_text_encoder \
+         siglip_b_16_image_encoder siglip_b_16_text_encoder \
+         paddle_ocr_v5_mobile_detection paddle_ocr_v5_mobile_recognition; do
+  curl -Lo "models/$m.hef" "$HEF_8L/$m.hef"
+done
+```
+
+The supporting files in Step 2 (BPE vocabulary, `spiece.model`, OCR dictionary) are device-independent — download those unchanged.
+
+##### Quantization parameters: handled automatically
+
+Quantization parameters are a property of **how a particular HEF was compiled**, not of the model architecture, so a Hailo-8L build will generally differ from the Hailo-8 values that used to be hardcoded. Getting them wrong is dangerous precisely because it is *silent*: `dequantize_uint16()` applies whatever scale and zero-point it is handed, so wrong constants produce no exception, no warning, and no obviously broken output — just **plausible numbers that are subtly wrong**. The embeddings come out correctly shaped and correctly normalized and are quietly degraded, and the only symptom is smart search returning worse matches than it should.
+
+**You no longer have to do anything about this.** The pipeline reads the quantization parameters from whichever HEF it actually loads, at startup. The constants in `config.py` are now only a fallback, used when the HailoRT version does not expose quantization info. At startup the log prints both the value read from the HEF and the config constant for every affected stream, and warns loudly if they disagree — so a mismatch on an 8L card is visible rather than silent:
+
+```
+INFO  siglip_image.output quant: HEF scale=0.00041 zp=8800 | config scale=0.000325549... zp=9506 | MISMATCH
+WARN  siglip_image.output QUANTIZATION MISMATCH — ... Using the HEF values ...
+```
+
+That warning is expected and correct on Hailo-8L.
+
+On a **Hailo-8**, two outcomes are both healthy:
+
+- `… | match` — the HEF agrees with the constants; identical behaviour to before.
+- `not exposed by this HailoRT — using config fallback` — this runtime does not report quantization info, so the constants are used. Also identical behaviour to before, and not a problem.
+
+`MISMATCH` is the only one that warrants attention on a Hailo-8. It means the HEF-reading logic is at fault rather than your hardware — set `CLIP_QUANT_SOURCE=config` to restore the previous behaviour and please report it.
+
+##### Still manual: SCRFD output layer names
+
+`ScrfdConfig.output_layers` hardcodes `scrfd_2_5g/conv42`, `conv43`, `conv49`, `conv50`, `conv55`, `conv56`. These are **not** inferred automatically.
+
+If the 8L build names its layers differently, `decode_scrfd` finds no match, logs a warning, and returns an empty list — so **face detection quietly finds zero faces in every image**. It does not crash, and no request fails. Like the quantization case it is quiet, but unlike it there is an explicit log line naming the problem, and the symptom (no faces, ever) is unmistakable once you look:
+
+```
+WARNING SCRFD decode: no matching output layers found in ['scrfd_2_5g/conv42', ...]
+```
+
+Checking and fixing the names needs a built base image, so the procedure comes later: see [Step 3b (Hailo-8L only): derive SCRFD layer names](#step-3b-hailo-8l-only-derive-scrfd-layer-names). Finish downloading models first.
+
+##### Status: URLs verified, hardware not
+
+All eight Hailo-8L URLs above returned HTTP 200 when this was written. They are published artifacts on Hailo's S3 bucket and can be moved, renamed, or re-versioned without notice — if one 404s, check the [Hailo Model Zoo](https://github.com/hailo-ai/hailo_model_zoo/tree/master/docs/public_models) for the current path.
+
+The models have **not been run on Hailo-8L hardware by the maintainer** — this project is developed and tested on a Hailo-8. This path is documented on the strength of the artifacts existing, not on an end-to-end run. If you try it, reports of what worked and what needed changing are welcome.
+
 ### Step 2: Download Supporting Files
 
 **CLIP BPE Tokenizer Vocabulary** (TinyCLIP only, from [OpenAI CLIP](https://github.com/mlfoundations/open_clip/blob/main/src/open_clip/bpe_simple_vocab_16e6.txt.gz)):
@@ -155,29 +248,111 @@ curl -Lo models/ppocrv5_dict.txt \
 
 ### Step 3: Build Docker Images
 
-```bash
-# Build base image (HailoRT + Python deps)
-docker build -t hailo-base:v4.23.0 -f Dockerfile.hailo-base .
+Both builds **require** `--build-arg HAILORT_VERSION`. Neither Dockerfile declares a default, so omitting it fails the build rather than quietly producing an image that carries one version in its tag and a different one inside.
 
-# Build application image
-docker build -t immich-ml-hailo:v4.23.0 -f Dockerfile.immich-ml-hailo .
+```bash
+# Your host driver's version — see Prerequisites
+export HAILORT_VERSION=4.24.0
+
+# Build base image (HailoRT + Python deps)
+docker build --build-arg HAILORT_VERSION="$HAILORT_VERSION" \
+  -t "hailo-base:v$HAILORT_VERSION" -f Dockerfile.hailo-base .
+
+# Build application image (FROM hailo-base:v$HAILORT_VERSION)
+docker build --build-arg HAILORT_VERSION="$HAILORT_VERSION" \
+  -t "immich-ml-hailo:v$HAILORT_VERSION" -f Dockerfile.immich-ml-hailo .
 ```
 
-> On ARM64, the base image build automatically detects the platform. If you need to cross-build, pass `--build-arg DEB_ARCH=arm64 --build-arg WHL_ARCH=aarch64`.
+> **Architecture.** `setup.sh` detects the host architecture and passes the matching `DEB_ARCH`/`WHL_ARCH` automatically, so building natively on the target machine — x86_64 or ARM64 — needs nothing extra.
+>
+> **Cross-building needs more than those two build args.** `Dockerfile.hailo-base` is `FROM ubuntu:24.04` with no platform pinning, so the image is built for whatever architecture the builder runs. On an x86 host, `--build-arg DEB_ARCH=arm64 --build-arg WHL_ARCH=aarch64` only changes *which HailoRT packages get installed* — the result is ARM64 packages inside an amd64 image, which fails at runtime. A genuine cross-build additionally requires `docker buildx` with `--platform linux/arm64` for **both** images, plus emulation or a native ARM builder. That path is not exercised by this project; building natively on the target host is the supported route.
+
+If the base build fails at the `COPY` step, the requested version's `.deb`/`.whl` are not in `hailo-rt-4/` under the expected names — that check is deliberate, so you find out before installing the wrong runtime.
+
+### Step 3b (Hailo-8L only): derive SCRFD layer names
+
+Skip this on Hailo-8 — the shipped values are correct there.
+
+`ScrfdConfig.output_layers` in `ml_target/config.py` names six layers from the Hailo-8 SCRFD build. If your 8L HEF names them differently, **face detection returns zero faces for every image** — nothing crashes and no request fails, so watch for the symptom described below rather than an error (see [Hailo-8L model substitution](#hailo-8l-model-substitution)).
+
+**`ml_target/` is copied into the app image at build time, so editing `config.py` requires rebuilding the app image.** Do this now, before the app image matters — inspect first, edit, then build.
+
+Inspect the HEF using the **base** image from Step 3, with the repo bind-mounted. No app image and no running container are needed:
+
+```bash
+docker run --rm \
+  --device=/dev/hailo0:/dev/hailo0 \
+  -v "$PWD/ml_target:/app/ml_target:ro" \
+  -v "$PWD/models:/app/models:ro" \
+  -w /app -e PYTHONPATH=/app \
+  "hailo-base:v$HAILORT_VERSION" \
+  python3 -m ml_target.hef_inspect /app/models/scrfd_2.5g.hef
+```
+
+The `=== OUTPUTS ===` block lists **nine** streams, not six: each of three strides has a class map, a bbox map, and a keypoint map. This pipeline uses the first two and ignores keypoints. Identify them by **shape** — that is authoritative, names vary between builds.
+
+Channel count says what a stream is:
+
+| Channels | Stream | Used |
+|---|---|---|
+| 2 | class/score map (2 anchors) | yes → `cls_layer_name` |
+| 8 | bbox map (2 anchors × 4 coords) | yes → `box_layer_name` |
+| 20 | keypoint/landmark map | no — ignore |
+
+Spatial size says which stride it belongs to, for this project's 640×640 input:
+
+| Shape | Stride |
+|---|---|
+| 80×80 | 8 |
+| 40×40 | 16 |
+| 20×20 | 32 |
+
+So a stream printed as `shape=(80, 80, 8)` is the stride-8 bbox map. Fill in `ScrfdConfig.output_layers` in `ml_target/config.py` on the host as three `(stride, cls_layer_name, box_layer_name)` entries, for strides 8, 16 and 32 — six of the nine names, keypoints discarded.
+
+As a cross-check: on the Hailo-8 build the nine outputs fall into consecutive triples per stride — `(conv42, conv43, conv44)`, `(conv49, conv50, conv51)`, `(conv55, conv56, conv57)` — each triple being `(cls, bbox, keypoints)`, in stride order 8, 16, 32. That is where the defaults `conv42`/`conv43`, `conv49`/`conv50`, `conv55`/`conv56` come from. **Use this only as a hint — the shapes are authoritative, and another build may name or order its layers differently.**
+
+Then rebuild the app image so the edit is in it — the second `docker build` from Step 3:
+
+```bash
+docker build --build-arg HAILORT_VERSION="$HAILORT_VERSION" \
+  -t "immich-ml-hailo:v$HAILORT_VERSION" -f Dockerfile.immich-ml-hailo .
+```
+
+**How to tell whether you got it right.** Wrong names do not raise — the request succeeds and simply reports no faces. Run the face-detection test from [Testing](#testing) and check the container log:
+
+- `SCRFD decode: no matching output layers found in [...]` — none of your names matched; face detection returns zero faces for every image.
+- Faces found at some scales but large or small ones consistently missed — only some entries matched; each unmatched stride is silently skipped.
+- `ValueError: Unexpected bbox channels for SCRFD: ...` — a name matched but points at the wrong tensor, most likely `cls` and `box` swapped in an entry.
+- No warnings and faces detected — correct.
+
+The same command inspects any other model, and also prints the quantization parameters the pipeline will read at startup:
+
+```bash
+docker run --rm --device=/dev/hailo0:/dev/hailo0 \
+  -v "$PWD/ml_target:/app/ml_target:ro" -v "$PWD/models:/app/models:ro" \
+  -w /app -e PYTHONPATH=/app "hailo-base:v$HAILORT_VERSION" \
+  python3 -m ml_target.hef_inspect /app/models/siglip_b_16_image_encoder.hef
+```
+
+Once the container is running, the same tool is available inside it — handy for later checks, though remember that any `config.py` edit still needs an image rebuild:
+
+```bash
+docker exec immich-ml-hailo python3 -m ml_target.hef_inspect /app/models/scrfd_2.5g.hef
+```
 
 ### Step 4: Extract CLIP Text Weights
 
-The CLIP text encoder needs CPU-side embedding weights extracted from the original model. Run the script for your chosen backend:
+The CLIP text encoder needs CPU-side embedding weights extracted from the original model. Both scripts run the extraction inside the `hailo-base` image you built in Step 3, so they need the same `HAILORT_VERSION` — pass it inline rather than relying on an `export` from an earlier step, which does not survive a new shell. Both scripts require it and abort if it is missing.
 
 **TinyCLIP:**
 ```bash
-./scripts/extract_tinyclip_weights.sh
+HAILORT_VERSION=4.24.0 ./scripts/extract_tinyclip_weights.sh
 # Downloads TinyCLIP checkpoint (~330MB), saves models/tinyclip_text_weights.npz
 ```
 
 **SigLIP:**
 ```bash
-./scripts/extract_siglip_weights.sh
+HAILORT_VERSION=4.24.0 ./scripts/extract_siglip_weights.sh
 # Downloads SigLIP model (~813MB), saves models/siglip_text_weights.npz + models/spiece.model
 ```
 
@@ -195,7 +370,7 @@ docker run -d \
   -e CLIP_BACKEND=siglip \
   --name immich-ml-hailo \
   --restart unless-stopped \
-  immich-ml-hailo:v4.23.0
+  immich-ml-hailo:v4.24.0     # the tag you built — must match your host driver
 ```
 
 Set `CLIP_BACKEND` to `siglip` or `tinyclip` (see [CLIP Backend Choice](#clip-backend-choice) for details). Both are included in the image — change the value and restart the container to switch, no rebuild needed.
@@ -221,16 +396,13 @@ All threshold settings (minimum detection score, maximum recognition distance, m
 
 Both CLIP backends are included in every Docker image. You switch between them by setting the `CLIP_BACKEND` environment variable at container startup — no rebuild needed:
 
-```bash
-# Use SigLIP (better quality, Immich-compatible)
-docker run -e CLIP_BACKEND=siglip ...
+Add one of these flags to the full `docker run` command in [Running](#running), then restart the container:
 
-# Use TinyCLIP (faster, default)
-docker run -e CLIP_BACKEND=tinyclip ...
-```
+- `-e CLIP_BACKEND=siglip` — better quality, Immich-compatible embeddings
+- `-e CLIP_BACKEND=tinyclip` — faster, and the default when the variable is unset
 
 - **SigLIP** (`CLIP_BACKEND=siglip`): Embeddings are compatible with Immich's `ViT-B-16-SigLIP__webli`. You can switch between this Hailo worker and the official Immich ML worker (with the same CLIP model selected in Immich) **without re-running Smart Search**.
-- **TinyCLIP** (`CLIP_BACKEND=tinyclip`): Embeddings are not compatible with any of Immich's available CLIP models (`ViT-SO400M-16-SigLIP2-384__webli`, `ViT-B-16-SigLIP2__webli`, `ViT-B-16-SigLIP__webli`, `ViT-B-32__laion2b-s34b-b79k`). Switching to/from the official ML worker requires re-running Smart Search.
+- **TinyCLIP** (`CLIP_BACKEND=tinyclip`): Embeddings are not compatible with any of the CLIP models Immich offered at the time of writing (`ViT-SO400M-16-SigLIP2-384__webli`, `ViT-B-16-SigLIP2__webli`, `ViT-B-16-SigLIP__webli`, `ViT-B-32__laion2b-s34b-b79k`). Immich's model list changes between releases — check yours before relying on this. Switching to/from the official ML worker requires re-running Smart Search.
 
 > **Note:** Changing `CLIP_BACKEND` between TinyCLIP and SigLIP also requires re-running Smart Search, since the embedding dimensions differ (512 vs 768).
 
@@ -247,30 +419,57 @@ docker cp tests/test.jpg immich-ml-hailo:/tmp/test.jpg
 docker exec immich-ml-hailo bash /tmp/test.sh /tmp/test.jpg
 ```
 
-The test suite validates all endpoints and inference pipelines (19 assertions).
+The test suite validates all endpoints and inference pipelines — 19 assertions when OCR is available, 18 when it is not (the two OCR checks collapse into a single skip).
+
+It reads `CLIP_BACKEND` from the container's environment and asserts the exact embedding dimension that backend must produce — 512 for TinyCLIP, 768 for SigLIP — so a SigLIP container that silently fell back to TinyCLIP fails the suite instead of passing it. The resolved backend is printed in the test header.
+
+The suite targets `http://localhost:3003` by default. Override with `BASE_URL` to test a remapped port or a service on another host — useful when running the script from your workstation rather than inside the container:
+
+```bash
+BASE_URL=http://192.168.1.50:3003 ./tests/test.sh tests/test.jpg
+```
 
 ## Debugging
 
-```bash
-# Interactive shell in a running container
-docker exec -it immich-ml-hailo /bin/bash
+Run on the **host**:
 
-# Inspect HEF model inputs/outputs
+```bash
+# Follow the container's logs
+docker logs -f immich-ml-hailo
+
+# Open an interactive shell inside the container
+docker exec -it immich-ml-hailo /bin/bash
+```
+
+Run **inside the container** — either from that shell, or prefixed with `docker exec immich-ml-hailo`:
+
+```bash
+# Inspect one HEF's inputs/outputs (shapes, formats, quantization params)
 python3 -m ml_target.hef_inspect /app/models/scrfd_2.5g.hef
 
-# Inspect all models
+# Inspect every HEF in models/
 python3 -m ml_target.inspect_models
-
-# View container logs
-docker logs -f immich-ml-hailo
 ```
 
 ## Project Structure
 
+The repository is 25 files and a few hundred kilobytes. **`models/` and `hailo-rt-4/` ship containing nothing but a `.gitkeep`** — every model, weight file, and runtime package is downloaded from its original source or generated on your machine at setup time. None of it is redistributed here, which is both why the repo is small and why `setup.sh` exists.
+
 ```
-hailo-rt-4/               # HailoRT .deb and .whl packages (not in repo, download manually)
-models/                   # HEF models, weights, and dictionaries
+.dockerignore             # Shared build context exclusions for both Dockerfiles
+.gitignore
+Dockerfile.hailo-base     # Base image: Ubuntu 24.04 + HailoRT
+Dockerfile.immich-ml-hailo # App image: FastAPI + models + inference code
+LICENSE                   # MIT
+README.md
+setup.sh                  # Full setup: check prereqs, download models, build, test
+hailo-rt-4/
+  .gitkeep                # Placeholder — you download the HailoRT .deb + .whl here
+models/
+  .gitkeep                # Placeholder — setup.sh downloads the HEFs and dictionaries,
+                          #   the extract scripts generate the .npz weights
 ml_target/                # Application code
+  __init__.py
   app.py                  # FastAPI endpoints: GET /, GET /ping, POST /predict
   config.py               # All model-specific configuration (paths, layer names, quant params)
   pipeline.py             # Pipeline initialization and inference orchestration
@@ -278,22 +477,29 @@ ml_target/                # Application code
   preprocessing.py        # Image transforms, CLIP preprocessing, L2 normalize
   decoders.py             # SCRFD face detection post-processing + NMS
   ocr.py                  # PaddleOCR DBNet post-processing + CTC decode
-  tokenizer.py            # CLIP BPE tokenizer (stdlib re, no regex dependency)
+  tokenizer.py            # CLIP BPE + SigLIP SentencePiece tokenizers
+  hailo_backend.py        # Back-compat shim; re-exports init_pipeline / run_inference
+  hef_inspect.py          # Utility: print one HEF's input/output stream info
+  inspect_models.py       # Utility: print stream info for every HEF in models/
 scripts/
   extract_tinyclip_weights.sh  # Generate tinyclip_text_weights.npz from checkpoint
+  extract_siglip_weights.sh    # Generate siglip_text_weights.npz + spiece.model
 tests/
-  test.sh                 # End-to-end test suite (19 assertions)
+  test.sh                 # End-to-end test suite (19 assertions / 18 without OCR)
   test.jpg                # Sample test image
-setup.sh                  # Full setup: check prereqs, download models, build, test
-Dockerfile.hailo-base     # Base image: Ubuntu 24.04 + HailoRT
-Dockerfile.immich-ml-hailo # App image: FastAPI + models + inference code
 ```
 
 ## Configuration
 
 All model parameters are in `ml_target/config.py`. To swap models (e.g., SCRFD 2.5G → SCRFD 10G), update the config dataclass — no inference code changes needed. See the docstrings in `config.py` for available alternatives.
 
-The models directory can be overridden with the `MODELS_DIR` environment variable.
+Environment variables:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `CLIP_BACKEND` | `tinyclip` | `tinyclip` or `siglip` — see [CLIP Backend Choice](#clip-backend-choice) |
+| `MODELS_DIR` | `/app/models` | Where the pipeline looks for HEFs and supporting files |
+| `CLIP_QUANT_SOURCE` | `hef` | `hef` reads CLIP quantization parameters from the loaded HEF, falling back to the `config.py` constants when the runtime does not expose them. `config` forces the constants. Only change this if the startup log reports a quantization mismatch on hardware you know was working. |
 
 ## License
 

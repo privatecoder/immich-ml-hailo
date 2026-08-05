@@ -1,0 +1,30 @@
+# Shared by both Dockerfiles — they build from the same context, so models/
+# (COPYed by the app image) and hailo-rt-4/ (COPYed by the base image) must both
+# stay. Listed below is everything neither image COPYs.
+#
+# This is not a build-context size optimization: BuildKit transfers only the
+# files a COPY actually resolves, so the measured context is already minimal
+# (~16 MB for the base image build — just the two HailoRT packages). What it
+# buys instead: nothing unreferenced can be dragged in by a future COPY or a
+# widened wildcard, .DS_Store and __pycache__ never reach the image, and a
+# non-BuildKit builder — which does send the whole context — skips .git.
+.git
+.gitignore
+.DS_Store
+**/.DS_Store
+# A leading ** is required to match at depth — a bare *.pyc matches root-level
+# files only, it does not cross a /.
+__pycache__/
+**/__pycache__/
+*.pyc
+**/*.pyc
+*.pyo
+**/*.pyo
+
+docs/
+tests/
+scripts/
+setup.sh
+*.md
+**/*.md
+LICENSE

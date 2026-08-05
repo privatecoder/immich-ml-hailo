@@ -1,4 +1,13 @@
-FROM hailo-base:v4.23.0
+# Pre-FROM scope: this ARG is visible to the FROM line only. It is NOT in scope
+# inside the build stage — if anything below ever references ${HAILORT_VERSION},
+# re-declare it with a bare `ARG HAILORT_VERSION` after the FROM, or it silently
+# expands to the empty string.
+#
+# Deliberately no default value. Omitting --build-arg HAILORT_VERSION resolves
+# this to `hailo-base:v` and fails immediately, rather than quietly building on
+# a stale base image while the output carries a newer tag.
+ARG HAILORT_VERSION
+FROM hailo-base:v${HAILORT_VERSION}
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-venv \
@@ -10,7 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN pip3 install --break-system-packages \
     fastapi uvicorn[standard] python-multipart pillow requests \
-    pyclipper shapely
+    pyclipper shapely sentencepiece
 
 WORKDIR /app
 

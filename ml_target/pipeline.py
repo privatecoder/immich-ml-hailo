@@ -2,9 +2,10 @@
 
 import json
 import logging
+import math
 import os
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import hailo_platform as hpf
@@ -13,25 +14,83 @@ from ml_target.config import OcrDetectionConfig, PipelineConfig
 from ml_target.decoders import decode_scrfd
 from ml_target.models import (
     HailoModel,
+    QuantParams,
     activate_model,
     configure_model,
     infer_single,
     pick_output,
 )
 from ml_target.preprocessing import (
-    center_crop_square,
     crop_and_resize_rgb,
+    dequantize_uint16,
     l2_normalize,
     letterbox_rgb,
-    prep_clip_image,
     prep_clip_text_input,
+    prep_siglip_image,
+    prep_tinyclip_image,
 )
 from ml_target.ocr import CTCDecoder, crop_text_region, decode_db_detection
-from ml_target.tokenizer import SimpleTokenizer
+from ml_target.tokenizer import SiglipTokenizer, SimpleTokenizer
 
 LOG = logging.getLogger("ml_target.pipeline")
 
 _PIPE = None
+
+# Relative tolerance for treating a HEF-read quant param as equal to the
+# config constant. The constants are stored at full float repr, so a genuine
+# match is exact; anything looser than this is a real difference.
+_QUANT_REL_TOL = 1e-9
+
+
+def _resolve_quant(
+    label: str,
+    hef_quant: Optional[QuantParams],
+    cfg_scale: float,
+    cfg_zp: float,
+    prefer_hef: bool,
+) -> Tuple[float, float]:
+    """Pick the quantization params to use, logging both candidate sources.
+
+    Quantization params belong to a specific HEF compilation, so the values read
+    from the loaded HEF are authoritative and the constants in config.py are a
+    fallback. Applying the wrong ones is silent — no exception, no warning from
+    HailoRT, just subtly wrong embeddings — so this logs what it chose and warns
+    loudly when the two sources disagree.
+    """
+    if hef_quant is None:
+        LOG.info(
+            "%s quant: not exposed by this HailoRT — using config fallback "
+            "scale=%.17g zp=%.17g", label, cfg_scale, cfg_zp,
+        )
+        return cfg_scale, cfg_zp
+
+    matches = (
+        math.isclose(hef_quant.qp_scale, cfg_scale, rel_tol=_QUANT_REL_TOL, abs_tol=1e-15)
+        and math.isclose(hef_quant.qp_zp, cfg_zp, rel_tol=_QUANT_REL_TOL, abs_tol=1e-15)
+    )
+
+    LOG.info(
+        "%s quant: HEF scale=%.17g zp=%.17g | config scale=%.17g zp=%.17g | %s",
+        label, hef_quant.qp_scale, hef_quant.qp_zp, cfg_scale, cfg_zp,
+        "match" if matches else "MISMATCH",
+    )
+
+    if not prefer_hef:
+        LOG.info("%s quant: CLIP_QUANT_SOURCE=config — using the config constants", label)
+        return cfg_scale, cfg_zp
+
+    if not matches:
+        LOG.warning(
+            "%s QUANTIZATION MISMATCH — HEF says scale=%.17g zp=%.17g, config.py has "
+            "scale=%.17g zp=%.17g. Using the HEF values, which is correct for a HEF "
+            "compiled for a different device (e.g. Hailo-8L). But if this device was "
+            "previously producing good search results with the config values, then the "
+            "HEF-reading logic is wrong, not your hardware: set CLIP_QUANT_SOURCE=config "
+            "to restore the previous behaviour, and please report it.",
+            label, hef_quant.qp_scale, hef_quant.qp_zp, cfg_scale, cfg_zp,
+        )
+
+    return hef_quant.qp_scale, hef_quant.qp_zp
 
 
 class _Timer:
@@ -70,36 +129,99 @@ class Pipeline:
             output_format=hpf.FormatType.FLOAT32,
         )
 
-        # CLIP image encoder
-        self.clip_img = configure_model(
-            self.vdevice,
-            cfg.hef_path(cfg.clip_image.hef),
-            input_format=hpf.FormatType.UINT8,
-            output_format=hpf.FormatType.FLOAT32,
-        )
+        # CLIP backend selection
+        self.clip_backend = cfg.clip_backend
+        LOG.info("CLIP backend: %s", self.clip_backend)
 
-        # CLIP text encoder
-        self.clip_txt = configure_model(
-            self.vdevice,
-            cfg.hef_path(cfg.clip_text.hef),
-            input_format=hpf.FormatType.UINT16,
-            output_format=hpf.FormatType.FLOAT32,
-        )
+        if self.clip_backend == "siglip":
+            sc = cfg.siglip_image
+            tc = cfg.siglip_text
 
-        # CLIP text weights
-        w = np.load(cfg.hef_path(cfg.clip_text.weights_npz))
-        self.token_embedding = np.asarray(w["token_embedding"], dtype=np.float32)
-        self.positional_embedding = np.asarray(w["positional_embedding"], dtype=np.float32)
-        self.text_projection = np.asarray(w["text_projection"], dtype=np.float32)
-        self.eot_token_id = int(np.asarray(w["eot_token_id"]).reshape(()))
+            self.clip_img = configure_model(
+                self.vdevice,
+                cfg.hef_path(sc.hef),
+                input_format=hpf.FormatType.UINT8,
+                output_format=hpf.FormatType.UINT16,
+            )
 
-        self.tokenizer = SimpleTokenizer(cfg.hef_path(cfg.clip_text.bpe_gz))
+            self.clip_txt = configure_model(
+                self.vdevice,
+                cfg.hef_path(tc.hef),
+                input_format=hpf.FormatType.UINT16,
+                output_format=hpf.FormatType.UINT16,
+            )
 
-        LOG.info("CLIP text assets loaded:")
-        LOG.info("  token_embedding=%s", self.token_embedding.shape)
-        LOG.info("  positional_embedding=%s", self.positional_embedding.shape)
-        LOG.info("  text_projection=%s", self.text_projection.shape)
-        LOG.info("  eot_token_id=%d", self.eot_token_id)
+            w = np.load(cfg.hef_path(tc.weights_npz))
+            self.token_embedding = np.asarray(w["token_embedding"], dtype=np.float32)
+            self.positional_embedding = np.asarray(w["position_embedding"], dtype=np.float32)
+            self.text_projection = None  # SigLIP pools internally, no CPU-side projection
+            self.eot_token_id = None
+
+            self.tokenizer = SiglipTokenizer(
+                cfg.hef_path(tc.spiece_model),
+                pad_token_id=tc.pad_token_id,
+            )
+
+            # SigLIP quantizes on the way in and dequantizes on the way out, for
+            # both the text and image encoders — all three resolved here.
+            self.clip_txt_in_quant = _resolve_quant(
+                "siglip_text.input", self.clip_txt.input_quant,
+                tc.input_qp_scale, tc.input_qp_zp, cfg.quant_from_hef,
+            )
+            self.clip_txt_out_quant = _resolve_quant(
+                "siglip_text.output", self.clip_txt.output_quant,
+                tc.output_qp_scale, tc.output_qp_zp, cfg.quant_from_hef,
+            )
+            self.clip_img_out_quant = _resolve_quant(
+                "siglip_image.output", self.clip_img.output_quant,
+                sc.output_qp_scale, sc.output_qp_zp, cfg.quant_from_hef,
+            )
+
+            LOG.info("SigLIP text assets loaded:")
+            LOG.info("  token_embedding=%s", self.token_embedding.shape)
+            LOG.info("  positional_embedding=%s", self.positional_embedding.shape)
+
+        else:  # tinyclip (default)
+            sc = cfg.tinyclip_image
+            tc = cfg.tinyclip_text
+
+            self.clip_img = configure_model(
+                self.vdevice,
+                cfg.hef_path(sc.hef),
+                input_format=hpf.FormatType.UINT8,
+                output_format=hpf.FormatType.FLOAT32,
+            )
+
+            self.clip_txt = configure_model(
+                self.vdevice,
+                cfg.hef_path(tc.hef),
+                input_format=hpf.FormatType.UINT16,
+                output_format=hpf.FormatType.FLOAT32,
+            )
+
+            w = np.load(cfg.hef_path(tc.weights_npz))
+            self.token_embedding = np.asarray(w["token_embedding"], dtype=np.float32)
+            self.positional_embedding = np.asarray(w["positional_embedding"], dtype=np.float32)
+            self.text_projection = np.asarray(w["text_projection"], dtype=np.float32)
+            self.eot_token_id = int(np.asarray(w["eot_token_id"]).reshape(()))
+
+            self.tokenizer = SimpleTokenizer(cfg.hef_path(tc.bpe_gz))
+
+            # TinyCLIP quantizes only on the way in, and only for the text
+            # encoder. Both TinyCLIP models request FLOAT32 output, so HailoRT
+            # dequantizes on-device and there are no output params to resolve.
+            self.clip_txt_in_quant = _resolve_quant(
+                "tinyclip_text.input", self.clip_txt.input_quant,
+                tc.input_qp_scale, tc.input_qp_zp, cfg.quant_from_hef,
+            )
+            self.clip_txt_out_quant = None
+            self.clip_img_out_quant = None
+
+            LOG.info("TinyCLIP text assets loaded:")
+            LOG.info("  token_embedding=%s", self.token_embedding.shape)
+            LOG.info("  positional_embedding=%s", self.positional_embedding.shape)
+            LOG.info("  text_projection=%s", self.text_projection.shape)
+            LOG.info("  eot_token_id=%d", self.eot_token_id)
 
         # OCR models (optional — loaded only if HEFs and char dict exist)
         self.ocr_det: Optional[HailoModel] = None
@@ -296,38 +418,65 @@ def _run_clip(
 ) -> Dict[str, Any]:
     clip_cfg = task_cfg if isinstance(task_cfg, dict) else {}
     wants_text = "text" in clip_cfg or "textual" in clip_cfg
+    is_siglip = _PIPE.clip_backend == "siglip"
 
     # ── TEXT ──
     if wants_text:
         if not text:
             return {"clip": {"error": "missing text"}}
 
-        LOG.info("CLIP TEXT: len=%d", len(text))
+        LOG.info("CLIP TEXT [%s]: len=%d", _PIPE.clip_backend, len(text))
 
-        tc = cfg.clip_text
-        token_ids = _PIPE.tokenizer.tokenize(text, context_length=tc.context_length).astype(np.int32, copy=False)
+        if is_siglip:
+            tc = cfg.siglip_text
+            token_ids = _PIPE.tokenizer.tokenize(text, context_length=tc.context_length).astype(np.int32, copy=False)
 
-        eot_positions = np.where(token_ids == _PIPE.eot_token_id)[0]
-        eot_pos = int(eot_positions[0]) if eot_positions.size > 0 else tc.context_length - 1
+            in_scale, in_zp = _PIPE.clip_txt_in_quant
+            xb = prep_clip_text_input(
+                token_ids,
+                _PIPE.token_embedding,
+                _PIPE.positional_embedding,
+                qp_scale=in_scale,
+                qp_zp=in_zp,
+            )
 
-        xb = prep_clip_text_input(
-            token_ids,
-            _PIPE.token_embedding,
-            _PIPE.positional_embedding,
-            qp_scale=tc.qp_scale,
-            qp_zp=tc.qp_zp,
-        )
+            with _Timer("clip_text_infer"):
+                out = infer_single(_PIPE.clip_txt, xb)
 
-        with _Timer("clip_text_infer"):
-            out = infer_single(_PIPE.clip_txt, xb)
+            # SigLIP output is 1x1x768 UINT16 — dequantize
+            out_scale, out_zp = _PIPE.clip_txt_out_quant
+            emb_f32 = dequantize_uint16(
+                np.asarray(pick_output(out)).squeeze(),
+                out_scale, out_zp,
+            )
+            emb = l2_normalize(emb_f32)
 
-        y = np.asarray(pick_output(out), dtype=np.float32).squeeze()
-        if y.shape != (tc.context_length, tc.embed_dim):
-            raise ValueError(f"Unexpected text encoder output shape: {y.shape}")
+        else:  # tinyclip
+            tc = cfg.tinyclip_text
+            token_ids = _PIPE.tokenizer.tokenize(text, context_length=tc.context_length).astype(np.int32, copy=False)
 
-        eot_vec = y[eot_pos].reshape(1, tc.embed_dim)
-        proj = (eot_vec @ _PIPE.text_projection).reshape(-1)
-        emb = l2_normalize(proj)
+            eot_positions = np.where(token_ids == _PIPE.eot_token_id)[0]
+            eot_pos = int(eot_positions[0]) if eot_positions.size > 0 else tc.context_length - 1
+
+            in_scale, in_zp = _PIPE.clip_txt_in_quant
+            xb = prep_clip_text_input(
+                token_ids,
+                _PIPE.token_embedding,
+                _PIPE.positional_embedding,
+                qp_scale=in_scale,
+                qp_zp=in_zp,
+            )
+
+            with _Timer("clip_text_infer"):
+                out = infer_single(_PIPE.clip_txt, xb)
+
+            y = np.asarray(pick_output(out), dtype=np.float32).squeeze()
+            if y.shape != (tc.context_length, tc.embed_dim):
+                raise ValueError(f"Unexpected text encoder output shape: {y.shape}")
+
+            eot_vec = y[eot_pos].reshape(1, tc.embed_dim)
+            proj = (eot_vec @ _PIPE.text_projection).reshape(-1)
+            emb = l2_normalize(proj)
 
         return {"clip": json.dumps(emb.tolist(), separators=(",", ":"))}
 
@@ -335,14 +484,30 @@ def _run_clip(
     if image_rgb is None:
         return {"clip": {"error": "missing image"}}
 
-    LOG.info("CLIP IMAGE: H=%d W=%d", H0, W0)
+    LOG.info("CLIP IMAGE [%s]: H=%d W=%d", _PIPE.clip_backend, H0, W0)
 
-    xb = prep_clip_image(image_rgb, cfg.clip_image.crop_size, _PIPE.clip_img.input_format)
+    if is_siglip:
+        sc = cfg.siglip_image
+        xb = prep_siglip_image(image_rgb, sc.crop_size)
 
-    with _Timer("clip_image_infer"):
-        clip_out = infer_single(_PIPE.clip_img, xb)
+        with _Timer("clip_image_infer"):
+            clip_out = infer_single(_PIPE.clip_img, xb)
 
-    emb = l2_normalize(np.asarray(pick_output(clip_out), dtype=np.float32).squeeze())
+        out_scale, out_zp = _PIPE.clip_img_out_quant
+        emb_f32 = dequantize_uint16(
+            np.asarray(pick_output(clip_out)).squeeze(),
+            out_scale, out_zp,
+        )
+        emb = l2_normalize(emb_f32)
+
+    else:  # tinyclip
+        sc = cfg.tinyclip_image
+        xb = prep_tinyclip_image(image_rgb, sc.crop_size, _PIPE.clip_img.input_format)
+
+        with _Timer("clip_image_infer"):
+            clip_out = infer_single(_PIPE.clip_img, xb)
+
+        emb = l2_normalize(np.asarray(pick_output(clip_out), dtype=np.float32).squeeze())
 
     return {
         "clip": json.dumps(emb.tolist(), separators=(",", ":")),

@@ -278,6 +278,25 @@ class Pipeline:
 
         # Face recognition — one of only two models that ever receives more
         # than one frame, so one of only two worth giving a device batch size.
+        #
+        # Same loud-failure rule as the detector: a core task, and a worker that
+        # started without it would return detections with no embeddings.
+        rec_hef = cfg.hef_path(cfg.arcface.hef)
+        if not os.path.exists(rec_hef):
+            raise ConfigError(
+                f"Face recognition model not found: {rec_hef}\n"
+                f"  FACE_RECOGNIZER={cfg.face_recognizer} requires {cfg.arcface.hef}.\n"
+                f"  Download it:\n"
+                f"    curl -fLo models/{cfg.arcface.hef} {MODEL_ZOO_BASE}/{cfg.arcface.hef}\n"
+                f"  or re-run ./setup.sh, which fetches every recognition variant.\n"
+                f"  Refusing to start: face recognition is a core task."
+            )
+
+        LOG.info(
+            "Face recognizer: %s (%s, %d-dim, %dx%d crops)",
+            cfg.face_recognizer, cfg.arcface.hef,
+            cfg.arcface.embed_dim, cfg.arcface.crop_size, cfg.arcface.crop_size,
+        )
         LOG.info(
             "Hailo device batch size: face=%s ocr=%s",
             cfg.face_batch_size or "<not configured>",
@@ -285,7 +304,7 @@ class Pipeline:
         )
         self.rec = configure_model(
             self.vdevice,
-            cfg.hef_path(cfg.arcface.hef),
+            rec_hef,
             input_format=hpf.FormatType.UINT8,
             output_format=hpf.FormatType.FLOAT32,
             batch_size=cfg.face_batch_size,
@@ -575,7 +594,7 @@ def _run_facial_recognition(
                     group = patches[start : start + step]
                     xb, n_real = _pad_to_batch(_to_batch(group), rec_batch)
                     rec_out = rec_infer(xb)
-                    part = np.asarray(pick_output(rec_out, hint="fc1"), dtype=np.float32)
+                    part = np.asarray(pick_output(rec_out, hint=cfg.arcface.output_hint), dtype=np.float32)
                     if part.ndim > 2:
                         part = part.reshape(part.shape[0], -1)
                     # Discard padded rows here, at the boundary, before this
@@ -584,6 +603,14 @@ def _run_facial_recognition(
                     parts.append(part[:n_real])
 
         emb_all = parts[0] if len(parts) == 1 else np.concatenate(parts, axis=0)
+
+        if emb_all.shape[1] != cfg.arcface.embed_dim:
+            LOG.warning(
+                "face embeddings are %d-dim but %s is configured for %d — "
+                "check ARCFACE_VARIANTS[%r]['embed_dim'] against the HEF",
+                emb_all.shape[1], cfg.face_recognizer, cfg.arcface.embed_dim,
+                cfg.face_recognizer,
+            )
 
         if emb_all.shape[0] != len(dets):
             # Refuse to guess: attaching the wrong embedding to a bounding box

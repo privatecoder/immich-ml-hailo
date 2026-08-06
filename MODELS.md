@@ -18,7 +18,7 @@ Every model must exist as a compiled `.hef` for Hailo-8 in the [Hailo Model Zoo]
 | Role | Model | Source | Device latency | Output |
 |---|---|---|---|---|
 | Face detection | `scrfd_2.5g` *(default)* or `scrfd_10g` | Model Zoo v2.17.0 | 2.53 / 4.40 ms | 9 output streams, 3 strides |
-| Face recognition | `arcface_r50` | v2.17.0 | 20.36 ms | 512-dim, L2-normalized |
+| Face recognition | `arcface_r50` *(default)* or `arcface_mobilefacenet` | v2.17.0 | 20.36 / 1.09 ms | 512-dim, L2-normalized |
 | Smart search (default) | `tinyclip_vit_39m_16_text_19m_yfcc15m` | v2.17.0 | 46.66 ms | 512-dim |
 | Smart search (quality) | `siglip_b_16` | v2.18.0 | 205.70 ms | 768-dim |
 | OCR detection | `paddle_ocr_v5_mobile_detection` | v2.18.0 | not benchmarked | 544×960 probability map |
@@ -157,7 +157,30 @@ Weighted over an **assumed** distribution of faces per photo (1: 40%, 2: 25%, 3:
 
 ## Evaluated alternatives
 
-### Shipped as a selectable option
+### Shipped as selectable options
+
+#### `arcface_mobilefacenet` — **shipped**, selectable with `FACE_RECOGNIZER=arcface_mobilefacenet`
+
+Both recognition models ship and `setup.sh` downloads both, so switching is a container restart. **`arcface_r50` remains the default**, and the reason is not speed.
+
+| | LFW accuracy | Device latency | Device FPS |
+|---|---|---|---|
+| `arcface_r50` *(default)* | **99.7%** | 20.36 ms | 35.2 |
+| `arcface_mobilefacenet` | 99.4% | **1.09 ms** | **5191** |
+
+**The accuracy trade is the headline.** 0.3 pp on LFW reads as noise and is not, because this is face *identity* and the failure mode is user-visible: two people merged into one cluster, or one person split across two, each needing manual correction in Immich. That is more annoying than a slow initial scan, and it is why this is an option rather than a new default.
+
+**The speed is real but secondary.** 18.7× lower latency, measured. An earlier revision of this document rated this "low to medium value-for-effort" on the reasoning that recognition was not the bottleneck and that a smaller model would only reduce the ~1.1 ms of per-face compute while leaving the 26.3 ms burst overhead. **That reasoning was wrong** — the burst overhead is weight loading, and mobilefacenet is 3.9 MiB against R50's 29.7 MiB, so a smaller model removes almost all of it rather than almost none. `rec_infer_batch` should fall from 35.2 ms for 5 faces to a few milliseconds.
+
+**The default-vs-option reasoning is unchanged, but the reason has shifted.** It was previously "not worth the effort because recognition is cheap". It is now "worth real speed, but the cost lands on the user's data": switching changes the face **embeddings themselves**, so every vector stored in Immich becomes incomparable with new ones. Immich must re-run its face jobs across the whole library — clusters rebuilt from scratch, every named person reconfirmed by hand. Hours of processing plus manual work, and nobody should have their people-tagging reset by pulling an update.
+
+A legitimate choice for someone indexing a large library from scratch who accepts the accuracy trade knowingly. Not a default.
+
+Note mobilefacenet's 5191 FPS matches Hailo's published figure exactly, while `arcface_r50` is 3.2× off its published 113. That corroborates this one number; it is not a rule — `scrfd_2.5g` is equally small and 1.86× off.
+
+**Golden references are keyed by recognition model**, since the face embedding changes completely. Switching makes `golden.sh check` skip rather than fail, and needs a fresh `generate`.
+
+> **Unverified against the HEF:** output layer name, embedding dimension and input crop size are carried in `ARCFACE_VARIANTS` as ArcFace-family defaults (`fc1`, 512, 112×112) and marked TODO in `config.py`. Confirm with `hef_inspect` before shipping — see [Evaluating a candidate on this hardware](#evaluating-a-candidate-on-this-hardware).
 
 #### `scrfd_10g` — **shipped**, selectable with `FACE_DETECTOR=scrfd_10g`
 
@@ -191,24 +214,6 @@ More detections also means more ArcFace crops — cheap now that recognition is 
 **Golden references are keyed by detector**, because a different detector produces different crops and therefore different face embeddings. Switching detectors makes `golden.sh check` skip rather than fail, and needs a fresh `generate`.
 
 ### Worth doing
-
-#### `arcface_mobilefacenet` — the largest measured win available
-
-| | LFW accuracy | Device latency | Device FPS |
-|---|---|---|---|
-| `arcface_r50` *(current)* | 99.7% | 20.36 ms | 35.2 |
-| `arcface_mobilefacenet` | 99.4% | **1.09 ms** | **5191** |
-
-**18.7× lower latency, measured.** Earlier revisions of this document rated this "low to medium value" on the reasoning that recognition was not the bottleneck and that a smaller model would only reduce the ~1.1 ms of per-face compute while leaving the 26.3 ms burst overhead. **That reasoning was wrong**, and the device benchmark shows why: the burst overhead is weight loading, and mobilefacenet is 3.9 MiB against R50's 29.7 MiB. A smaller model removes almost all of it, not almost none of it.
-
-Face recognition would go from 35.2 ms per request to an estimated **2–3 ms**. *(Estimate, not measured in-pipeline: 1.09 ms device latency plus the host-side share, extrapolated from the other stages. Worth measuring before committing.)*
-
-The cost is unchanged and remains the reason this is not simply switched on:
-
-- **99.4% vs 99.7% LFW** — a real accuracy loss on face matching, small but not nothing.
-- **Changing face embeddings invalidates existing face clusters.** Immich must re-run its face jobs across the entire library. For a large library that is hours of work and a period of degraded people-search.
-
-That trade is genuinely a user's to make, not a default to change. But it is now a *much* better deal than this document previously claimed, and it is the single largest speed improvement available to the face pipeline.
 
 #### SigLIP2 B/32-256 — a quality upgrade at zero speed cost
 

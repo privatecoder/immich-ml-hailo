@@ -269,4 +269,11 @@ def pick_output(outputs: Dict[str, np.ndarray], hint: Optional[str] = None) -> n
         for k in outputs:
             if hint in k:
                 return outputs[k]
+        # Falling through here means returning an arbitrary tensor from a
+        # multi-output model — a silent wrong-tensor path. Say so.
+        LOG.warning(
+            "pick_output: hint %r matched none of %s — returning the first output. "
+            "If this model was recently swapped, its output name has changed.",
+            hint, list(outputs.keys()),
+        )
     return next(iter(outputs.values()))

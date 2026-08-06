@@ -201,13 +201,101 @@ def scrfd_config_for(name: str) -> ScrfdConfig:
 
 @dataclass
 class ArcfaceConfig:
+    """Face recognition model config for one variant.
+
+    Built by arcface_config_for(); see ARCFACE_VARIANTS below.
+    """
     hef: str = "arcface_r50.hef"
     crop_size: int = 112
+    embed_dim: int = 512
+    # Substring used to pick this model's embedding tensor out of the inference
+    # result. Only load-bearing when the HEF exposes more than one output — but
+    # when it does and the hint matches nothing, pick_output() falls back to an
+    # arbitrary entry, which is a silent wrong-tensor path. Hence per-variant.
+    output_hint: str = "fc1"
     # Host-side cap on frames per infer() call. Only takes effect when a device
     # batch size is configured; without one, all crops go in a single call as
     # they always have. The step actually used is the largest multiple of the
     # device batch that fits under this.
     rec_chunk_size: int = 32
+
+
+# ── ArcFace variants ──────────────────────────────────────────────────
+#
+# Selected by FACE_RECOGNIZER. Both HEFs ship, so switching is a restart —
+# but unlike the detector, switching is NOT free: see the warning below.
+#
+# **arcface_r50 is and should remain the default.** The detector choice only
+# changes which faces are found; the recognition model changes the face
+# *embeddings themselves*. Every stored vector in Immich becomes incomparable
+# with newly produced ones, so the whole library must re-run its face jobs:
+# clusters are rebuilt from scratch and named people have to be reconfirmed by
+# hand. That is a serious, hours-long imposition on someone who merely pulled
+# an update, and it must never happen because a default moved underneath them.
+#
+# The speed difference is large (19x lower latency, measured) but it is NOT the
+# reason to switch, and it is not the headline. The trade is accuracy on face
+# *identity*: 99.7% -> 99.4% LFW. That sounds negligible and is not, because the
+# failure mode is visible and annoying — two people merged into one cluster, or
+# one person split across two. A slow first scan is forgotten; a mis-clustered
+# family album is not.
+#
+# Latencies are `hailortcli benchmark` on a production Hailo-8, HailoRT 4.24.0.
+# mobilefacenet's 5191 FPS matches Hailo's published figure exactly; arcface_r50
+# is 3.2x off its published 113. That is a corroboration of one number, not a
+# rule — scrfd_2.5g is equally small and 1.86x off.
+
+ARCFACE_VARIANTS = {
+    "arcface_r50": {
+        "hef": "arcface_r50.hef",
+        "lfw": 99.7,
+        "latency_ms": 20.36,
+        # Verified in production: this is the model that has always shipped.
+        "crop_size": 112,
+        "embed_dim": 512,
+        "output_hint": "fc1",
+    },
+    "arcface_mobilefacenet": {
+        "hef": "arcface_mobilefacenet.hef",
+        "lfw": 99.4,
+        "latency_ms": 1.09,
+        # Verified against the HEF with hef_inspect on a Hailo-8, not assumed:
+        #   INPUT   arcface_mobilefacenet/input_layer1  shape=(112, 112, 3)
+        #   OUTPUT  arcface_mobilefacenet/fc1           shape=(512,)
+        # So this is a structural drop-in for arcface_r50 — same crop, same
+        # embedding width, same output name. Worth checking rather than
+        # assuming: scrfd_10g looked equally drop-in and in fact renumbered
+        # two of its three stride outputs, which would have failed silently.
+        "crop_size": 112,
+        "embed_dim": 512,
+        "output_hint": "fc1",
+    },
+}
+
+# Which recognition model to load. Task-named to match FACE_DETECTOR.
+FACE_RECOGNIZER = os.environ.get("FACE_RECOGNIZER", "arcface_r50").strip().lower()
+
+
+def arcface_config_for(name: str) -> ArcfaceConfig:
+    """Build the ArcfaceConfig for a named variant. Raises on an unknown name.
+
+    Never falls back: silently recognising faces with a different model than
+    requested would write embeddings from the wrong vector space into Immich.
+    """
+    variant = ARCFACE_VARIANTS.get(name)
+    if variant is None:
+        raise ConfigError(
+            f"FACE_RECOGNIZER={name!r} is not a known face recognition model.\n"
+            f"  Valid values: {', '.join(sorted(ARCFACE_VARIANTS))}\n"
+            f"  Refusing to fall back: face embeddings from the wrong model are\n"
+            f"  not comparable with the ones already stored in Immich."
+        )
+    return ArcfaceConfig(
+        hef=variant["hef"],
+        crop_size=variant["crop_size"],
+        embed_dim=variant["embed_dim"],
+        output_hint=variant["output_hint"],
+    )
 
 
 # ── TinyCLIP CLIP backend ────────────────────────────────────────────
@@ -344,10 +432,17 @@ class PipelineConfig:
     # constants in the CLIP configs below.
     quant_from_hef: bool = CLIP_QUANT_SOURCE != "config"
 
-    # Face detection / recognition
+    # Face detection / recognition.
+    #
+    # The selector strings are the source of truth; the model configs are
+    # resolved from them in __post_init__. Passing a config explicitly still
+    # overrides, but PipelineConfig(face_detector="scrfd_10g") now actually
+    # loads scrfd_10g — with a default_factory reading the module-level env
+    # constant, the two fields could silently disagree.
     face_detector: str = FACE_DETECTOR
-    scrfd: ScrfdConfig = field(default_factory=lambda: scrfd_config_for(FACE_DETECTOR))
-    arcface: ArcfaceConfig = field(default_factory=ArcfaceConfig)
+    face_recognizer: str = FACE_RECOGNIZER
+    scrfd: Optional[ScrfdConfig] = None
+    arcface: Optional[ArcfaceConfig] = None
 
     # CLIP — TinyCLIP config (used when clip_backend == "tinyclip")
     tinyclip_image: TinyClipImageConfig = field(default_factory=TinyClipImageConfig)
@@ -360,6 +455,15 @@ class PipelineConfig:
     # OCR
     ocr_detection: OcrDetectionConfig = field(default_factory=OcrDetectionConfig)
     ocr_recognition: OcrRecognitionConfig = field(default_factory=OcrRecognitionConfig)
+
+    def __post_init__(self) -> None:
+        # Resolve the selectable models from their selector strings. Also where
+        # an unknown FACE_DETECTOR / FACE_RECOGNIZER raises, so a bad value
+        # fails at construction rather than at first inference.
+        if self.scrfd is None:
+            self.scrfd = scrfd_config_for(self.face_detector)
+        if self.arcface is None:
+            self.arcface = arcface_config_for(self.face_recognizer)
 
     def hef_path(self, filename: str) -> str:
         return os.path.join(self.models_dir, filename)

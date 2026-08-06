@@ -119,6 +119,10 @@ COMMON_FILES=(
     # restart rather than a download.
     "scrfd_10g.hef|$HEF_BASE/scrfd_10g.hef"
     "arcface_r50.hef|$HEF_BASE/arcface_r50.hef"
+    # Both recognition models are fetched so FACE_RECOGNIZER is a restart.
+    # arcface_r50 stays the default: switching changes face embeddings and
+    # forces Immich to re-run its face jobs across the library.
+    "arcface_mobilefacenet.hef|$HEF_BASE/arcface_mobilefacenet.hef"
     "paddle_ocr_v5_mobile_detection.hef|$HEF_V218/paddle_ocr_v5_mobile_detection.hef"
     "paddle_ocr_v5_mobile_recognition.hef|$HEF_V218/paddle_ocr_v5_mobile_recognition.hef"
     "ppocrv5_dict.txt|$DICT_URL"

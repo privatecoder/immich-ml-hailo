@@ -11,7 +11,7 @@ This worker accelerates the following Immich jobs on the Hailo-8:
 | **Smart Search** | TinyCLIP ViT-39M/16 **or** SigLIP B/16 | CLIP image embeddings for semantic search |
 | **Duplicate Detection** | (uses Smart Search embeddings) | No separate inference — reuses CLIP embeddings |
 | **Face Detection** | SCRFD 2.5G *or* SCRFD 10G | Detects faces in images — see [Face detector](#face-detector) |
-| **Facial Recognition** | ArcFace R50 | Generates face embeddings for grouping people |
+| **Facial Recognition** | ArcFace R50 *or* MobileFaceNet | Generates face embeddings for grouping people — see [Face recognition model](#face-recognition-model) |
 | **OCR** | PaddleOCR v5 mobile | Extracts text from images |
 
 Other Immich jobs (Generate Thumbnails, Extract Metadata, Transcode Videos, Sidecar Metadata, External Libraries, Storage Template Migration) run on the Immich server itself and are not affected by this worker.
@@ -480,7 +480,7 @@ It covers CLIP visual, CLIP textual, and the ArcFace face embedding, plus the de
 >
 > A stale reference fails with a large similarity drop that looks exactly like a regression. The checker warns when the container image tag or the test image has changed since the reference was captured, but it cannot detect every case.
 
-References live in `tests/golden/` (gitignored, one file per CLIP-backend / face-detector combination — e.g. `siglip__scrfd_2.5g.json`) and are **not** shipped in the repo — generate them on your own deployment. `check` skips cleanly with instructions when no reference exists, so it is safe to run on a fresh install. Run `generate` once per combination you use — changing either `CLIP_BACKEND` or `FACE_DETECTOR` needs its own reference, and an unseen combination skips rather than failing.
+References live in `tests/golden/` (gitignored, one file per CLIP-backend / detector / recognizer combination — e.g. `siglip__scrfd_2.5g__arcface_r50.json`) and are **not** shipped in the repo — generate them on your own deployment. `check` skips cleanly with instructions when no reference exists, so it is safe to run on a fresh install. Run `generate` once per combination you use — changing `CLIP_BACKEND`, `FACE_DETECTOR` or `FACE_RECOGNIZER` needs its own reference, and an unseen combination skips rather than failing.
 
 Environment: `BASE_URL`, `CONTAINER`, `GOLDEN_DIR`, and `SAMPLES` (repeats used to measure the noise floor, default 10).
 
@@ -499,7 +499,7 @@ Run it on the Docker host, with `LOG_LEVEL` at `INFO` or `DEBUG` (it aborts othe
 
 **Pause Immich's ML jobs first.** Concurrent traffic both competes for the device and writes into the same log; the script warns when it sees more matching lines than it sent, which means the numbers are contaminated.
 
-To compare two runs, keep the image, iteration count, CLIP backend and face detector identical — face and OCR timings scale with how many faces and text regions the image happens to contain.
+To compare two runs, keep the image, iteration count, CLIP backend, face detector and face recognizer identical — face and OCR timings scale with how many faces and text regions the image happens to contain.
 
 **Record the batch settings and the detector with every run.** `HAILO_BATCH_SIZE_FACE` and `HAILO_BATCH_SIZE_OCR` change `rec_infer_batch` and `ocr_rec_batch` by a factor of several, so two runs are only comparable if both are known. The script prints the container's resolved image tag and backend but cannot see these, since they take effect at model-configure time — note them yourself alongside the results.
 
@@ -582,7 +582,7 @@ tests/
   test.sh                 # End-to-end test suite (19 assertions / 18 without OCR)
   golden.sh               # Golden-embedding regression test (generate | check)
   test.jpg                # Sample test image
-  golden/                 # Generated references — gitignored, per device, backend and detector
+  golden/                 # Generated references — gitignored, per device, backend, detector and recognizer
 ```
 
 ## Configuration
@@ -601,6 +601,7 @@ Environment variables:
 | `HAILO_BATCH_SIZE_OCR` | `8` | Device batch size for OCR text recognition. `default` disables device batching on this path. |
 | `HAILO_BATCH_SIZE` | `8` | Fallback for both of the above. A per-path variable always wins — including when it is set to `default`. |
 | `FACE_DETECTOR` | `scrfd_2.5g` | Face detection model — `scrfd_2.5g` or `scrfd_10g`. See [Face detector](#face-detector). An unrecognised value fails at startup rather than falling back. |
+| `FACE_RECOGNIZER` | `arcface_r50` | Face recognition model — `arcface_r50` or `arcface_mobilefacenet`. **Changing this forces Immich to re-run its face jobs.** See [Face recognition model](#face-recognition-model). An unrecognised value fails at startup. |
 
 All three are read at startup, so **changing them is a container restart, not a rebuild.**
 
@@ -647,6 +648,37 @@ docker run -d ... -e FACE_DETECTOR=scrfd_10g ...
 > **Switching detectors invalidates the golden face reference.** A different detector finds different faces at slightly different boxes, so the crops differ and so do the ArcFace embeddings — the face count may change too. References are keyed by CLIP backend *and* detector, so an unseen combination **skips** with an explicit message rather than failing. Run `./tests/golden.sh generate` after switching. See [Golden embedding test](#golden-embedding-test).
 
 If the selected HEF is missing, the worker **refuses to start** and names the file and its download URL. Face detection is a core task; a worker running without it would answer every request with zero faces and no error.
+
+### Face recognition model
+
+Two recognition models ship, selected with `FACE_RECOGNIZER`. Both HEFs are in the image.
+
+**Read the trade before the speed.** This is face *identity*: the embedding is what Immich clusters people by.
+
+| | LFW accuracy | Device latency |
+|---|---|---|
+| **`arcface_r50`** *(default)* | **99.7%** | 20.36 ms |
+| `arcface_mobilefacenet` | 99.4% | **1.09 ms** |
+
+0.3 percentage points sounds negligible and is not. The failure mode is visible and irritating: two people merged into one cluster, or one person split across two, needing manual correction in the Immich UI. A slower first scan is forgotten in a week; a mis-clustered family album is not. **`arcface_r50` is the default and should stay it for most people.**
+
+Against that, the speed difference is genuinely large — 19× lower latency, measured with `hailortcli` on a Hailo-8. In the pipeline, `rec_infer_batch` is 35.2 ms for 5 faces; mobilefacenet should bring that to a few milliseconds, and combined with `FACE_DETECTOR=scrfd_10g` a face request could fall from ~101 ms toward ~65 ms.
+
+That is worth considering if you are indexing a very large library from scratch and accept the accuracy trade knowingly.
+
+```bash
+docker run -d ... -e FACE_RECOGNIZER=arcface_mobilefacenet ...
+```
+
+> **⚠️ Switching recognition models forces a re-index of faces.**
+>
+> Unlike the detector, this changes the face **embeddings themselves**. Every vector already stored in Immich becomes incomparable with newly produced ones, so **Immich must re-run its face jobs across the whole library**: clusters are rebuilt from scratch and every named person has to be reconfirmed by hand. On a large library that is hours of processing plus real manual work.
+>
+> This is why it is an option and not a default — not because the speed is unwelcome, but because no one should have their people-tagging reset by pulling an update.
+
+Golden references are keyed by recognition model too, so switching makes `./tests/golden.sh check` skip rather than fail. Regenerate after switching.
+
+If the selected HEF is missing, the worker refuses to start and names the file — the same rule as the detector.
 
 ### Detection caps
 

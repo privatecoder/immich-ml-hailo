@@ -88,6 +88,9 @@ BACKEND="${BACKEND:-tinyclip (default, not set in env)}"
 DETECTOR=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$CONTAINER" 2>/dev/null \
            | awk -F= '/^FACE_DETECTOR=/{print $2}' | head -1)
 DETECTOR="${DETECTOR:-scrfd_2.5g (default, not set in env)}"
+RECOGNIZER=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$CONTAINER" 2>/dev/null \
+             | awk -F= '/^FACE_RECOGNIZER=/{print $2}' | head -1)
+RECOGNIZER="${RECOGNIZER:-arcface_r50 (default, not set in env)}"
 
 # The worker only emits the summary line at INFO or below.
 LOGLEVEL=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$CONTAINER" 2>/dev/null \
@@ -102,6 +105,7 @@ echo "  Target:     $BASE_URL"
 echo "  Container:  $CONTAINER_NAME ($IMAGE_TAG)"
 echo "  Backend:    $BACKEND"
 echo "  Detector:   $DETECTOR"
+echo "  Recognizer: $RECOGNIZER"
 echo "  Image:      $IMAGE"
 echo "  Iterations: $ITERATIONS per task"
 echo ""
@@ -222,6 +226,6 @@ bench_task "ocr (detect + recognise)" \
 
 bold "Done."; echo ""
 echo "  Stage names map onto pipeline steps. To compare two runs, keep the image,"
-echo "  the iteration count, the backend and the detector identical — face and OCR timings scale"
+echo "  the iteration count, the backend, the detector and the recognizer identical — face and OCR timings scale"
 echo "  with how many faces and text regions the image contains."
 echo ""

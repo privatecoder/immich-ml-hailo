@@ -60,6 +60,20 @@ $*
 #
 # This matters: asserting "512 or 768" would let a SigLIP run that silently fell
 # back to TinyCLIP pass the whole suite.
+# Face recognizer -> expected embedding dimension. ARCFACE_VARIANTS in
+# ml_target/config.py is the source of truth; this mirrors it the same way the
+# CLIP dimensions below are mirrored. If you change a variant's embed_dim there,
+# change it here too.
+FACE_RECOGNIZER_RAW="${FACE_RECOGNIZER:-arcface_r50}"
+FACE_RECOGNIZER=$(printf '%s' "$FACE_RECOGNIZER_RAW" | tr '[:upper:]' '[:lower:]')
+case "$FACE_RECOGNIZER" in
+    arcface_r50)           FACE_DIM=512 ;;
+    # TODO(verify-on-hardware): unconfirmed — read the output shape with
+    # `python3 -m ml_target.hef_inspect /app/models/arcface_mobilefacenet.hef`
+    arcface_mobilefacenet) FACE_DIM=512 ;;
+    *)                     FACE_DIM=512 ;;
+esac
+
 CLIP_BACKEND_RAW="${CLIP_BACKEND:-tinyclip}"
 CLIP_BACKEND=$(printf '%s' "$CLIP_BACKEND_RAW" | tr '[:upper:]' '[:lower:]')
 if [[ "$CLIP_BACKEND" == "siglip" ]]; then
@@ -73,6 +87,7 @@ bold "=== immich-ml-hailo test suite ==="; echo ""
 echo "Target:  $BASE_URL"
 echo "Image:   $IMAGE"
 echo "Backend: $CLIP_BACKEND (expecting ${CLIP_DIM}-dim CLIP embeddings)"
+echo "Faces:   $FACE_RECOGNIZER (expecting ${FACE_DIM}-dim face embeddings)"
 if [[ "$CLIP_BACKEND" != "tinyclip" && "$CLIP_BACKEND" != "siglip" ]]; then
     echo "  $(yellow NOTE): CLIP_BACKEND='$CLIP_BACKEND_RAW' is not a recognized backend."
     echo "        The service falls back to tinyclip, so 512 dims are expected."

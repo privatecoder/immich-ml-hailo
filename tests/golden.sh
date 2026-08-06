@@ -81,6 +81,9 @@ BACKEND="${BACKEND:-tinyclip}"
 DETECTOR=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$CONTAINER" 2>/dev/null \
            | awk -F= '/^FACE_DETECTOR=/{print $2}' | head -1)
 DETECTOR="${DETECTOR:-scrfd_2.5g}"
+RECOGNIZER=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$CONTAINER" 2>/dev/null \
+             | awk -F= '/^FACE_RECOGNIZER=/{print $2}' | head -1)
+RECOGNIZER="${RECOGNIZER:-arcface_r50}"
 IMAGE_SUM=$(cksum < "$IMAGE" | awk '{print $1"-"$2}')
 
 # Keyed by BOTH the CLIP backend and the face detector.
@@ -88,13 +91,14 @@ IMAGE_SUM=$(cksum < "$IMAGE" | awk '{print $1"-"$2}')
 # The CLIP references depend only on the backend, but the face reference
 # depends on the detector: a different detector finds different faces, at
 # slightly different boxes, so the crops differ and therefore the ArcFace
-# embeddings differ — and the face count itself may change. A single-key
-# reference would make switching detectors look like an embedding regression.
+# embeddings differ — and the face count itself may change. The recognizer
+# changes the face embedding directly and completely. A single-key reference
+# would make either switch look like an embedding regression.
 #
 # Keying the whole file by both duplicates the CLIP vectors across detectors,
 # which is a few KB and buys a much better failure mode: an unseen combination
 # SKIPS with an explicit message instead of FAILING.
-REF_FILE="$GOLDEN_DIR/${BACKEND}__${DETECTOR}.json"
+REF_FILE="$GOLDEN_DIR/${BACKEND}__${DETECTOR}__${RECOGNIZER}.json"
 
 # Python does the vector maths. Prefer the host interpreter; fall back to the
 # container's, since a bare Unraid host has no python3. Programs are fed on
@@ -109,6 +113,7 @@ echo "  Target:    $BASE_URL"
 echo "  Container: $IMAGE_TAG"
 echo "  Backend:   $BACKEND"
 echo "  Detector:  $DETECTOR"
+echo "  Recognizer: $RECOGNIZER"
 echo "  Image:     $IMAGE"
 echo "  Reference: $REF_FILE"
 echo ""
@@ -172,7 +177,7 @@ if [[ "$MODE" == "generate" ]]; then
         cat <<'PY'
 import json, sys, datetime
 
-backend, image_tag, image_sum, text_query, detector = sys.argv[1:6]
+backend, image_tag, image_sum, text_query, detector, recognizer = sys.argv[1:7]
 
 def unit(v):
     n = sum(x * x for x in v) ** 0.5
@@ -258,6 +263,7 @@ doc = {
                 "Regenerate deliberately when the model, HEF version or device changes.",
     "backend": backend,
     "face_detector": detector,
+    "face_recognizer": recognizer,
     "image_tag": image_tag,
     "test_image_cksum": image_sum,
     "text_query": text_query,
@@ -270,7 +276,7 @@ doc = {
 }
 json.dump(doc, sys.stdout, separators=(",", ":"))
 PY
-    } | py "$BACKEND" "$IMAGE_TAG" "$IMAGE_SUM" "$TEXT_QUERY" "$DETECTOR" > "$WORK/ref.json"
+    } | py "$BACKEND" "$IMAGE_TAG" "$IMAGE_SUM" "$TEXT_QUERY" "$DETECTOR" "$RECOGNIZER" > "$WORK/ref.json"
 
     mv "$WORK/ref.json" "$REF_FILE"
     echo ""
@@ -286,7 +292,7 @@ fi
 # ── check ─────────────────────────────────────────────────────────────
 
 if [[ ! -f "$REF_FILE" ]]; then
-    echo "  $(yellow SKIP): no reference for CLIP backend '$BACKEND' + face detector '$DETECTOR'"
+    echo "  $(yellow SKIP): no reference for CLIP backend '$BACKEND' + detector '$DETECTOR' + recognizer '$RECOGNIZER'"
     echo ""
     echo "  Expected: $REF_FILE"
     echo "  Create it against a build you trust:"
@@ -297,8 +303,8 @@ if [[ ! -f "$REF_FILE" ]]; then
     echo "  the repo and must be generated on this deployment."
     echo ""
     echo "  Each CLIP-backend / face-detector combination needs its own reference:"
-    echo "  the detector changes which faces are found and where, which changes the"
-    echo "  crops and therefore the face embeddings. Switching detectors is a"
+    echo "  the detector changes which faces are found and where, and the"
+    echo "  recognizer changes the face embedding outright. Switching either is a"
     echo "  configuration change, not a regression — regenerate rather than debug."
     echo ""
     exit 0

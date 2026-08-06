@@ -505,6 +505,26 @@ To compare two runs, keep the image, iteration count, CLIP backend, face detecto
 
 This is a tool you reach for deliberately. It is not part of `setup.sh`.
 
+See **[BENCHMARKS.md](BENCHMARKS.md)** for every measurement taken on this hardware — device benchmarks, per-stage timings, the batch-size sweep, concurrency curves — and the exact commands to reproduce each one.
+
+### Concurrency benchmark
+
+`scripts/benchmark_concurrency.sh` answers a different question: **does firing requests in parallel improve throughput?**
+
+```bash
+./scripts/benchmark_concurrency.sh                      # clip, 20 requests, C=1,2,4,8
+./scripts/benchmark_concurrency.sh face                 # facial-recognition
+./scripts/benchmark_concurrency.sh ocr tests/test.jpg 40 "1 2 4 8 16"
+```
+
+It sweeps concurrency levels and reports throughput (requests/sec), wall clock, and **both** client-side and server-side latency. The gap between those two is the queue wait, which is what distinguishes "requests are queueing" from "requests are getting slower".
+
+Pick the task deliberately — the three have very different CPU/device ratios, so the shape of the curve differs. CLIP visual is device-dominated (~224 ms device against ~49 ms JPEG decode); facial recognition is CPU-dominated (~17 ms device against the same ~49 ms decode); OCR sits between them.
+
+Before measuring the worker it runs a **control**: the same requests with deliberately invalid `entries`, so the full image upload happens but the request is rejected before any inference. If control throughput does not scale with concurrency, the load generator is the bottleneck rather than the worker, and the script says so and marks the results void. Without that check a flat result is ambiguous.
+
+Same discipline as the latency benchmark: read-only, pause Immich's ML jobs first, and hold the image, request count, backend, detector and recognizer constant between runs. A diagnostic tool, not part of `setup.sh`.
+
 ## Debugging
 
 Run on the **host**:
@@ -554,6 +574,7 @@ Dockerfile.hailo-base     # Base image: Ubuntu 24.04 + HailoRT
 Dockerfile.immich-ml-hailo # App image: FastAPI + models + inference code
 LICENSE                   # MIT
 MODELS.md                 # Model choices, evaluated alternatives, upgrade paths
+BENCHMARKS.md             # Measured numbers and how to reproduce them
 README.md
 setup.sh                  # Full setup: check prereqs, download models, build, test
 hailo-rt-4/
@@ -578,10 +599,14 @@ scripts/
   extract_tinyclip_weights.sh  # Generate tinyclip_text_weights.npz from checkpoint
   extract_siglip_weights.sh    # Generate siglip_text_weights.npz + spiece.model
   benchmark.sh                 # Per-stage p50/p95 latency against a running container
+  benchmark_concurrency.sh     # Throughput vs concurrency sweep, with a load-generator control
 tests/
   test.sh                 # End-to-end test suite (19 assertions / 18 without OCR)
   golden.sh               # Golden-embedding regression test (generate | check)
   test.jpg                # Sample test image
+  ocr-align.jpg           # 64-cell position-encoding grid for OCR alignment checks
+  ocr-align.svg           # Source the grid was rendered from
+  verify_ocr_align.py     # Asserts text[i] names the cell box[i] sits in
   golden/                 # Generated references — gitignored, per device, backend, detector and recognizer
 ```
 
@@ -601,6 +626,8 @@ Environment variables:
 | `HAILO_BATCH_SIZE_OCR` | `8` | Device batch size for OCR text recognition. `default` disables device batching on this path. |
 | `HAILO_BATCH_SIZE` | `8` | Fallback for both of the above. A per-path variable always wins — including when it is set to `default`. |
 | `FACE_DETECTOR` | `scrfd_2.5g` | Face detection model — `scrfd_2.5g` or `scrfd_10g`. See [Face detector](#face-detector). An unrecognised value fails at startup rather than falling back. |
+| `REQUEST_MODE` | `serial` | `serial` runs one request at a time; `threadpool` overlaps host CPU work with device time. See [Request handling](#request-handling). Opt-in — reverting is a restart. |
+| `REQUEST_THREADS` | `4` | Worker threads when `REQUEST_MODE=threadpool`. Measured optimum; 8 buys +3% for double the peak memory. |
 | `FACE_RECOGNIZER` | `arcface_r50` | Face recognition model — `arcface_r50` or `arcface_mobilefacenet`. **Changing this forces Immich to re-run its face jobs.** See [Face recognition model](#face-recognition-model). An unrecognised value fails at startup. |
 
 All three are read at startup, so **changing them is a container restart, not a rebuild.**
@@ -623,6 +650,39 @@ Padding is cheap here precisely because the overhead is per burst — a burst co
 The one case where batching loses is a photo with exactly **one** face: 28.8 ms → 35.2 ms. That is roughly 3% of a request whose total is ~205 ms, and it is repaid from two faces upward. If your library is overwhelmingly single-face portraits, `HAILO_BATCH_SIZE_FACE=default` reverts that path — but measure before assuming it helps.
 
 `ScrfdConfig.max_faces` (default 100) bounds the recognition batch: at batch 8 that is at most 13 bursts for a single image.
+
+### Request handling
+
+By default the worker handles **one request at a time**. `REQUEST_MODE=threadpool` lets it overlap the host-side work of one request with the device time of another.
+
+**What can and cannot overlap.** There is one accelerator, so device time can never overlap device time — a single global lock serialises every inference call. What overlaps is everything else: JPEG decode (which dominates, ~49 ms for a 2360×2360 image), letterboxing, SCRFD decode and NMS, crop extraction, and embedding serialisation. That is the entire win, and it is bounded by how much host work a request does relative to its device work.
+
+Measured on a Hailo-8 (HailoRT 4.24.0, SigLIP, 2360×2360 image, 20 requests per level):
+
+| Configuration | C=1 | C=2 | C=4 | C=8 |
+|---|---|---|---|---|
+| face, `serial` | 9.03 | — | — | 9.73 RPS *(1.08×)* |
+| face, `threadpool`, `arcface_r50` | 9.88 | — | — | 15.59 RPS *(1.58×)* |
+| face, `threadpool`, `arcface_mobilefacenet` | 12.67 | 20.86 | 26.53 | **28.37 RPS** *(2.24×)* |
+| clip, `threadpool` | 3.53 | — | — | 4.12 RPS *(1.17×)* |
+
+CLIP gains little because it is device-bound — 224 ms of its 275 ms is the accelerator, so there is almost nothing to hide. Face gains most, and gains more with a faster recognition model, because shrinking device time raises the ceiling on what pipelining can achieve.
+
+`REQUEST_THREADS=4` is the measured optimum: 8 threads yields 29.28 RPS against 4 threads' 28.37 — **+3% for double the peak memory**. The limit is host-side serialisation rather than thread count; the worker reaches roughly half the device's theoretical ceiling and that is where this design lands.
+
+> **`threadpool` is opt-in for now, on purpose.** Correctness under load has been verified — three separate 64-region OCR alignment checks returned `exact=64 SHIFTED=0` while 60 requests ran at C=8 against a genuinely saturated worker, plus a bit-exact `golden.sh check` and 19/19 on the test suite. But that is a saturated 60-request run, **not a full library scan**, and a rare race would need sustained real-world load to surface. Enable it deliberately, watch the first scan, and remember that reverting is `REQUEST_MODE=serial` and a restart — no rebuild.
+
+#### Immich's side — none of this works without it
+
+**Immich decides how many requests to send.** Smart Search, Face Detection and OCR each have their own **job concurrency** setting under *Administration → Settings → Job Settings*. At the default of **1**, Immich issues one request at a time and waits for the response, so the worker never sees overlapping requests and `REQUEST_MODE=threadpool` changes nothing whatsoever.
+
+**Recommended: 3.**
+
+The reasoning, from the table above: face throughput is 20.86 at C=2, 26.53 at C=4 and 28.37 at C=8 — so it is nearly saturated by C=4, and the last doubling buys only **+7%**. CLIP saturates earlier still. 3 captures the large majority of the available gain.
+
+The tie-breaker for 3 over 4 is that these are **three independent settings**. If more than one job type is draining its queue at once, the worker sees their *sum*, not the largest — three jobs at 4 each could offer 12 concurrent requests against 4 worker threads. Size them together, and keep the total near `REQUEST_THREADS`.
+
+> **Do not set these high.** Past saturation, extra concurrency adds no throughput at all and only deepens the queue. In the measured sweep, client p95 latency rose from **70 ms at C=1 to 289 ms at C=8** while throughput moved 26.53 → 28.37. A value like 8 or 16 buys nothing and makes every request slower.
 
 ### Face detector
 

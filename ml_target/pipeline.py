@@ -4,6 +4,7 @@ import json
 import logging
 import math
 import os
+import threading
 import time
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -192,6 +193,49 @@ class _Timer:
 
 # Public alias — app.py times image decoding with it.
 stage = _Timer
+
+
+# ── Device serialisation ──────────────────────────────────────────────
+#
+# There is one Hailo accelerator, so one global lock is the right granularity.
+# Per-model locks would buy nothing (the device is the contended resource, not
+# any individual network group) and would invite lock-ordering deadlocks the
+# moment a request touched two models — which the face and OCR paths both do.
+#
+# RLock rather than Lock: nothing nests today, but a future caller wrapping an
+# already-locked helper would deadlock the whole worker with a plain Lock,
+# which is a far worse outcome than the reentrancy RLock quietly allows. This
+# is the one place where failing safe beats failing loud.
+#
+# THE POINT IS WHAT STAYS OUTSIDE. Holding this across a whole request would
+# reproduce the serialisation it exists to remove, with extra machinery and
+# more risk. Only the inference calls themselves are inside.
+_DEVICE_LOCK = threading.RLock()
+
+# Guards the one-time pipeline construction. Startup is single-threaded today
+# (Starlette runs the startup event before accepting connections), so this is
+# belt-and-braces against a future lazy-init path rather than a live race.
+_INIT_LOCK = threading.Lock()
+
+
+@contextmanager
+def device_lock() -> Generator[None, None, None]:
+    """Serialise access to the accelerator.
+
+    Records the time spent waiting as `lock_wait` on the request trace, so
+    contention shows up directly in the per-request summary line and in
+    scripts/benchmark.sh rather than having to be inferred.
+    """
+    t0 = time.perf_counter()
+    _DEVICE_LOCK.acquire()
+    waited = (time.perf_counter() - t0) * 1000.0
+    tr = _TRACE.get()
+    if tr is not None:
+        tr.add_ms("lock_wait", waited)
+    try:
+        yield
+    finally:
+        _DEVICE_LOCK.release()
 
 
 def _aligned_chunk(host_cap: int, batch_size: int) -> int:
@@ -441,8 +485,14 @@ class Pipeline:
 
 def init_pipeline(cfg: Optional[PipelineConfig] = None) -> None:
     global _PIPE
-    if _PIPE is not None:
-        return
+    with _INIT_LOCK:
+        if _PIPE is not None:
+            return
+        _init_pipeline_locked(cfg)
+
+
+def _init_pipeline_locked(cfg: Optional[PipelineConfig]) -> None:
+    global _PIPE
 
     if cfg is None:
         cfg = PipelineConfig()
@@ -537,7 +587,7 @@ def _run_facial_recognition(
         det_rgb, scale, pad_x, pad_y = letterbox_rgb(image_rgb, input_size, input_size)
     xb = np.ascontiguousarray(det_rgb[None, ...], dtype=np.uint8)
 
-    with _Timer("det_infer"):
+    with _Timer("det_infer"), device_lock():
         det_out = infer_single(_PIPE.det, xb)
 
     with _Timer("det_decode"):
@@ -587,7 +637,7 @@ def _run_facial_recognition(
         # No device batch configured: one call with everything, exactly as before.
         step = _aligned_chunk(cfg.arcface.rec_chunk_size, rec_batch) if rec_batch else len(patches)
 
-        with _Timer("rec_infer_batch"):
+        with _Timer("rec_infer_batch"), device_lock():
             with activate_model(_PIPE.rec) as rec_infer:
                 parts: List[np.ndarray] = []
                 for start in range(0, len(patches), step):
@@ -675,7 +725,7 @@ def _run_clip(
                 qp_zp=in_zp,
             )
 
-            with _Timer("clip_text_infer"):
+            with _Timer("clip_text_infer"), device_lock():
                 out = infer_single(_PIPE.clip_txt, xb)
 
             # SigLIP output is 1x1x768 UINT16 — dequantize
@@ -702,7 +752,7 @@ def _run_clip(
                 qp_zp=in_zp,
             )
 
-            with _Timer("clip_text_infer"):
+            with _Timer("clip_text_infer"), device_lock():
                 out = infer_single(_PIPE.clip_txt, xb)
 
             y = np.asarray(pick_output(out), dtype=np.float32).squeeze()
@@ -727,7 +777,7 @@ def _run_clip(
         with _Timer("clip_preprocess"):
             xb = prep_siglip_image(image_rgb, sc.crop_size)
 
-        with _Timer("clip_image_infer"):
+        with _Timer("clip_image_infer"), device_lock():
             clip_out = infer_single(_PIPE.clip_img, xb)
 
         out_scale, out_zp = _PIPE.clip_img_out_quant
@@ -742,7 +792,7 @@ def _run_clip(
         with _Timer("clip_preprocess"):
             xb = prep_tinyclip_image(image_rgb, sc.crop_size, _PIPE.clip_img.input_format)
 
-        with _Timer("clip_image_infer"):
+        with _Timer("clip_image_infer"), device_lock():
             clip_out = infer_single(_PIPE.clip_img, xb)
 
         emb = l2_normalize(np.asarray(pick_output(clip_out), dtype=np.float32).squeeze())
@@ -787,7 +837,7 @@ def _run_ocr(
         )
     xb = np.ascontiguousarray(det_input[None, ...], dtype=np.uint8)
 
-    with _Timer("ocr_det_infer"):
+    with _Timer("ocr_det_infer"), device_lock():
         det_out = infer_single(_PIPE.ocr_det, xb)
 
     # Get probability map from detection output
@@ -860,7 +910,7 @@ def _run_ocr(
     if ocr_batch:
         chunk_size = _aligned_chunk(chunk_size, ocr_batch)
 
-    with _Timer("ocr_rec_batch"):
+    with _Timer("ocr_rec_batch"), device_lock():
         with activate_model(_PIPE.ocr_rec) as rec_infer:
             for start in range(0, len(crops), chunk_size):
                 chunk = crops[start : start + chunk_size]

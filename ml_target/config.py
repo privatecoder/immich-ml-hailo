@@ -20,6 +20,40 @@ class ConfigError(RuntimeError):
     """
 
 
+# How requests are executed.
+#
+#   "serial"     (default) — `async def` handler, so every request runs to
+#                            completion on the event loop before the next
+#                            starts. Exactly the behaviour measured to date.
+#   "threadpool"           — `def` handler, so FastAPI runs it in a worker
+#                            thread and CPU work (JPEG decode, preprocessing,
+#                            post-processing) can overlap another request's
+#                            device time. Device access is serialised by a
+#                            single global lock in pipeline.py.
+#
+# Default is "serial" deliberately. The queueing it removes is measured, but
+# the *gain* is predicted, not measured — and the failure mode of getting
+# concurrency wrong here is silent data corruption (an embedding attached to
+# the wrong face) rather than a crash. Enabling is one env var and a restart;
+# flipping the default once the gain is measured on hardware is a one-line
+# change. That is the same sequence that worked for HAILO_BATCH_SIZE.
+REQUEST_MODE = os.environ.get("REQUEST_MODE", "serial").strip().lower()
+
+# Worker threads when REQUEST_MODE=threadpool. FastAPI's default is 40, which
+# is far too many here: only one thread can touch the device at a time, so the
+# rest queue on the lock while each holds a decoded image (a 2360x2360 RGB
+# frame is ~16.7 MB, plus up to ~3.8 MB of face crops at the max_faces cap).
+#
+# Useful concurrency is roughly total_time / device_time — measured, that is
+# 98/17 ≈ 5.8 for face, 275/224 ≈ 1.2 for CLIP, 195/140 ≈ 1.4 for OCR. 4 covers
+# CLIP and OCR completely and most of face, and bounds peak memory to ~4 frames.
+REQUEST_THREADS_RAW = os.environ.get("REQUEST_THREADS", "4").strip()
+
+try:
+    REQUEST_THREADS = max(1, int(REQUEST_THREADS_RAW))
+except ValueError:
+    REQUEST_THREADS = 4
+
 MODELS_DIR = os.environ.get("MODELS_DIR", "/app/models")
 CLIP_BACKEND = os.environ.get("CLIP_BACKEND", "tinyclip").lower()
 

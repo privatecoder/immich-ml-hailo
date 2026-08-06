@@ -9,6 +9,8 @@ Every model must exist as a compiled `.hef` for Hailo-8 in the [Hailo Model Zoo]
 3. **Measured cost on this Hailo-8** — not published figures, and not GPU numbers. All models share one 26 TOPS device.
 4. **Whether it is the bottleneck.** Making a fast stage faster buys nothing.
 
+> **Raw numbers and reproduction commands live in [BENCHMARKS.md](BENCHMARKS.md).** This file explains the model choices; that one records what the hardware does and how to measure it again.
+
 > **Read this first: the Model Zoo's published FPS figures do not predict what you will get.** Of the five models here with a published figure, three are off by 1.9× to 3.2× and two match exactly — with nothing to tell you in advance which kind you are looking at. Every performance number in this document was measured on the production device. See [Measured device performance](#measured-device-performance).
 
 ---
@@ -175,6 +177,8 @@ Both recognition models ship and `setup.sh` downloads both, so switching is a co
 **The default-vs-option reasoning is unchanged, but the reason has shifted.** It was previously "not worth the effort because recognition is cheap". It is now "worth real speed, but the cost lands on the user's data": switching changes the face **embeddings themselves**, so every vector stored in Immich becomes incomparable with new ones. Immich must re-run its face jobs across the whole library — clusters rebuilt from scratch, every named person reconfirmed by hand. Hours of processing plus manual work, and nobody should have their people-tagging reset by pulling an update.
 
 A legitimate choice for someone indexing a large library from scratch who accepts the accuracy trade knowingly. Not a default.
+
+**The model choice and the request mode compound, and anyone choosing models should know it.** Shrinking device time raises the ceiling on what request pipelining can hide behind it, so the two multiply rather than add. Measured with `REQUEST_MODE=threadpool` at C=8: **1.58×** with `arcface_r50`, **2.24×** with `arcface_mobilefacenet`. The faster model does not merely make each request quicker — it makes concurrency worth more, because a smaller share of the request is the serialised device section. Evaluate the pair together rather than each alone.
 
 Note mobilefacenet's 5191 FPS matches Hailo's published figure exactly, while `arcface_r50` is 3.2× off its published 113. That corroborates this one number; it is not a rule — `scrfd_2.5g` is equally small and 1.86× off.
 

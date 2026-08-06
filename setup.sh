@@ -114,6 +114,10 @@ step 2 "Checking model files in models/"
 # Common models (always needed)
 COMMON_FILES=(
     "scrfd_2.5g.hef|$HEF_BASE/scrfd_2.5g.hef"
+    # Both face detectors are fetched, for the same reason both CLIP backends
+    # are: scrfd_10g is 6.9 MB, and having it present makes FACE_DETECTOR a
+    # restart rather than a download.
+    "scrfd_10g.hef|$HEF_BASE/scrfd_10g.hef"
     "arcface_r50.hef|$HEF_BASE/arcface_r50.hef"
     "paddle_ocr_v5_mobile_detection.hef|$HEF_V218/paddle_ocr_v5_mobile_detection.hef"
     "paddle_ocr_v5_mobile_recognition.hef|$HEF_V218/paddle_ocr_v5_mobile_recognition.hef"
@@ -161,7 +165,10 @@ if [[ ${#DOWNLOADS[@]} -gt 0 ]]; then
             file="${entry%%|*}"
             url="${entry#*|}"
             echo "  Downloading $file..."
-            curl -Lo "$SCRIPT_DIR/models/$file" "$url"
+            # -f so an HTTP error is a failure, not an HTML error page
+            # written into a .hef that then fails cryptically at load time.
+            curl -fLo "$SCRIPT_DIR/models/$file" "$url" \
+                || fail "download failed ($url) — check the URL and your connection"
             ok "$file"
         done
     else
@@ -170,7 +177,7 @@ if [[ ${#DOWNLOADS[@]} -gt 0 ]]; then
         for entry in "${DOWNLOADS[@]}"; do
             file="${entry%%|*}"
             url="${entry#*|}"
-            echo "    curl -Lo models/$file $url"
+            echo "    curl -fLo models/$file $url"
         done
         exit 1
     fi

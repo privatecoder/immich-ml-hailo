@@ -12,7 +12,12 @@ from typing import Any, Dict, Generator, List, Optional, Tuple
 import numpy as np
 import hailo_platform as hpf
 
-from ml_target.config import OcrDetectionConfig, PipelineConfig
+from ml_target.config import (
+    MODEL_ZOO_BASE,
+    ConfigError,
+    OcrDetectionConfig,
+    PipelineConfig,
+)
 from ml_target.decoders import decode_scrfd
 from ml_target.models import (
     HailoModel,
@@ -245,10 +250,28 @@ class Pipeline:
         self.cfg = cfg
         self.vdevice = hpf.VDevice()
 
-        # Face detection
+        # Face detection.
+        #
+        # Unlike OCR, this does not degrade gracefully. Face detection is a core
+        # task: a worker that starts without it would answer every
+        # facial-recognition request with zero faces and no error, which reads
+        # to the user as "Immich found no faces in my library".
+        det_hef = cfg.hef_path(cfg.scrfd.hef)
+        if not os.path.exists(det_hef):
+            raise ConfigError(
+                f"Face detection model not found: {det_hef}\n"
+                f"  FACE_DETECTOR={cfg.face_detector} requires {cfg.scrfd.hef}.\n"
+                f"  Download it:\n"
+                f"    curl -fLo models/{cfg.scrfd.hef} {MODEL_ZOO_BASE}/{cfg.scrfd.hef}\n"
+                f"  or re-run ./setup.sh, which fetches every detector variant.\n"
+                f"  Refusing to start: face detection is a core task, and starting\n"
+                f"  without it would silently return zero faces for every image."
+            )
+
+        LOG.info("Face detector: %s (%s)", cfg.face_detector, cfg.scrfd.hef)
         self.det = configure_model(
             self.vdevice,
-            cfg.hef_path(cfg.scrfd.hef),
+            det_hef,
             input_format=hpf.FormatType.UINT8,
             output_format=hpf.FormatType.FLOAT32,
         )

@@ -10,7 +10,7 @@ This worker accelerates the following Immich jobs on the Hailo-8:
 |------------|-------------|-------|
 | **Smart Search** | TinyCLIP ViT-39M/16 **or** SigLIP B/16 | CLIP image embeddings for semantic search |
 | **Duplicate Detection** | (uses Smart Search embeddings) | No separate inference — reuses CLIP embeddings |
-| **Face Detection** | SCRFD 2.5G | Detects faces in images |
+| **Face Detection** | SCRFD 2.5G *or* SCRFD 10G | Detects faces in images — see [Face detector](#face-detector) |
 | **Facial Recognition** | ArcFace R50 | Generates face embeddings for grouping people |
 | **OCR** | PaddleOCR v5 mobile | Extracts text from images |
 
@@ -24,18 +24,20 @@ Two CLIP backends are available, selectable via the `CLIP_BACKEND` environment v
 |--|-------------------|--------|
 | Image input | 224x224 (center-crop) | 224x224 (squash resize) |
 | Embedding dim | 512 | 768 |
-| Image FPS *(vendor, device-only)* | ~60 | ~14 |
-| Text FPS *(vendor, device-only)* | ~18 | ~17 |
+| Image encode — **measured device** | **46.7 ms** (18.9 FPS) | **205.7 ms** (4.46 FPS) |
+| Image encode — in pipeline | — | 224.2 ms |
+| Image FPS — *vendor, published* | ~60 | ~14 |
+| Text FPS — *vendor, published* | ~18 | ~17 |
 | Search quality | Good | Better |
 | Immich model match | None | `ViT-B-16-SigLIP__webli` |
 
-> **The FPS rows are Hailo's device-only benchmark figures, and they are not what this worker delivers per request.** They measure the accelerator running a saturated stream; a `/predict` call also pays activation, virtual-stream setup and the host-side transfer for a single frame.
+> **The vendor row is roughly 3× optimistic for both backends** — measured on a Hailo-8 with `hailortcli benchmark`, TinyCLIP is 18.9 FPS against a published ~60, and SigLIP is 4.46 against ~14.
 >
-> Measured on a Hailo-8: SigLIP `clip_image_infer` is **224 ms per call**, about **4.5 FPS** — roughly a third of the vendor figure. The comparison between the two backends still holds (TinyCLIP is substantially faster than SigLIP); the absolute numbers do not.
+> Their *ratio* survives: 4.3× published, 4.2× measured. So the published figures are usable for choosing **between** the two models and misleading for predicting **how long a library scan takes**. Size a scan from the measured milliseconds.
 >
-> Both are true and neither should be read as the other. Use the vendor row to compare models, and the measured number to predict how long a library scan takes.
+> This is not specific to CLIP. Across the models benchmarked for this project, three of five published figures were off by 1.9–3.2× and two matched exactly, with no way to tell which in advance. See [MODELS.md](MODELS.md) for the measurements and the reason (large models on this device are bound by streaming weights across PCIe, not by compute).
 
-**TinyCLIP** is significantly faster (~4x for images) but produces embeddings incompatible with any Immich default model.
+**TinyCLIP** is significantly faster — **4.4× measured** on the device (46.7 ms against 205.7 ms), which is the one place the vendor ratio held up — but produces embeddings incompatible with any Immich default model.
 
 **SigLIP** produces the same embeddings as Immich's `ViT-B-16-SigLIP__webli` (same underlying Google model weights). This means you can switch between this Hailo worker and the official Immich ML worker **without re-running Smart Search** — the embeddings are compatible. The text encoder output is also simpler: already pooled to a single vector (no CPU-side projection needed).
 
@@ -124,8 +126,13 @@ The `curl` commands below are for **Hailo-8**. For **Hailo-8L**, see [Hailo-8L m
 
 **Face Detection** ([model card](https://github.com/hailo-ai/hailo_model_zoo/blob/master/docs/public_models/HAILO8/HAILO8_face_detection.rst)):
 ```bash
-curl -Lo models/scrfd_2.5g.hef \
+# Default detector
+curl -fLo models/scrfd_2.5g.hef \
   https://hailo-model-zoo.s3.eu-west-2.amazonaws.com/ModelZoo/Compiled/v2.17.0/hailo8/scrfd_2.5g.hef
+
+# Higher-accuracy alternative, selectable with FACE_DETECTOR=scrfd_10g (6.9 MB)
+curl -fLo models/scrfd_10g.hef \
+  https://hailo-model-zoo.s3.eu-west-2.amazonaws.com/ModelZoo/Compiled/v2.17.0/hailo8/scrfd_10g.hef
 ```
 
 **Face Recognition** ([model card](https://github.com/hailo-ai/hailo_model_zoo/blob/master/docs/public_models/HAILO8/HAILO8_face_recognition.rst)):
@@ -473,7 +480,7 @@ It covers CLIP visual, CLIP textual, and the ArcFace face embedding, plus the de
 >
 > A stale reference fails with a large similarity drop that looks exactly like a regression. The checker warns when the container image tag or the test image has changed since the reference was captured, but it cannot detect every case.
 
-References live in `tests/golden/` (gitignored, one file per CLIP backend) and are **not** shipped in the repo — generate them on your own deployment. `check` skips cleanly with instructions when no reference exists, so it is safe to run on a fresh install. Run `generate` once per backend you use.
+References live in `tests/golden/` (gitignored, one file per CLIP-backend / face-detector combination — e.g. `siglip__scrfd_2.5g.json`) and are **not** shipped in the repo — generate them on your own deployment. `check` skips cleanly with instructions when no reference exists, so it is safe to run on a fresh install. Run `generate` once per combination you use — changing either `CLIP_BACKEND` or `FACE_DETECTOR` needs its own reference, and an unseen combination skips rather than failing.
 
 Environment: `BASE_URL`, `CONTAINER`, `GOLDEN_DIR`, and `SAMPLES` (repeats used to measure the noise floor, default 10).
 
@@ -492,9 +499,9 @@ Run it on the Docker host, with `LOG_LEVEL` at `INFO` or `DEBUG` (it aborts othe
 
 **Pause Immich's ML jobs first.** Concurrent traffic both competes for the device and writes into the same log; the script warns when it sees more matching lines than it sent, which means the numbers are contaminated.
 
-To compare two runs, keep the image, iteration count and backend identical — face and OCR timings scale with how many faces and text regions the image happens to contain.
+To compare two runs, keep the image, iteration count, CLIP backend and face detector identical — face and OCR timings scale with how many faces and text regions the image happens to contain.
 
-**Record the batch settings with every run.** `HAILO_BATCH_SIZE_FACE` and `HAILO_BATCH_SIZE_OCR` change `rec_infer_batch` and `ocr_rec_batch` by a factor of several, so two runs are only comparable if both are known. The script prints the container's resolved image tag and backend but cannot see these, since they take effect at model-configure time — note them yourself alongside the results.
+**Record the batch settings and the detector with every run.** `HAILO_BATCH_SIZE_FACE` and `HAILO_BATCH_SIZE_OCR` change `rec_infer_batch` and `ocr_rec_batch` by a factor of several, so two runs are only comparable if both are known. The script prints the container's resolved image tag and backend but cannot see these, since they take effect at model-configure time — note them yourself alongside the results.
 
 This is a tool you reach for deliberately. It is not part of `setup.sh`.
 
@@ -575,7 +582,7 @@ tests/
   test.sh                 # End-to-end test suite (19 assertions / 18 without OCR)
   golden.sh               # Golden-embedding regression test (generate | check)
   test.jpg                # Sample test image
-  golden/                 # Generated references — gitignored, per device and HEF build
+  golden/                 # Generated references — gitignored, per device, backend and detector
 ```
 
 ## Configuration
@@ -593,6 +600,7 @@ Environment variables:
 | `HAILO_BATCH_SIZE_FACE` | `8` | Device batch size for ArcFace face recognition. `default` disables device batching on this path. |
 | `HAILO_BATCH_SIZE_OCR` | `8` | Device batch size for OCR text recognition. `default` disables device batching on this path. |
 | `HAILO_BATCH_SIZE` | `8` | Fallback for both of the above. A per-path variable always wins — including when it is set to `default`. |
+| `FACE_DETECTOR` | `scrfd_2.5g` | Face detection model — `scrfd_2.5g` or `scrfd_10g`. See [Face detector](#face-detector). An unrecognised value fails at startup rather than falling back. |
 
 All three are read at startup, so **changing them is a container restart, not a rebuild.**
 
@@ -614,6 +622,31 @@ Padding is cheap here precisely because the overhead is per burst — a burst co
 The one case where batching loses is a photo with exactly **one** face: 28.8 ms → 35.2 ms. That is roughly 3% of a request whose total is ~205 ms, and it is repaid from two faces upward. If your library is overwhelmingly single-face portraits, `HAILO_BATCH_SIZE_FACE=default` reverts that path — but measure before assuming it helps.
 
 `ScrfdConfig.max_faces` (default 100) bounds the recognition batch: at batch 8 that is at most 13 bursts for a single image.
+
+### Face detector
+
+Two SCRFD variants ship, selected with `FACE_DETECTOR`. Both HEFs are in the image, so switching is a container restart.
+
+| | mAP | Device latency | Share of a 96.8 ms face request |
+|---|---|---|---|
+| **`scrfd_2.5g`** *(default)* | 76.4 | **2.53 ms** | 2.6% |
+| `scrfd_10g` | **82.1** | **4.40 ms** | 4.5% |
+
+Measured with `hailortcli benchmark` on a Hailo-8, HailoRT 4.24.0.
+
+`scrfd_10g` costs **+1.87 ms** — under 2% of a face request — for **+5.7 mAP**, and is materially better on small, occluded and profile faces. `scrfd_2.5g` remains the default because it is the tested configuration and the one existing golden references were generated against.
+
+```bash
+docker run -d ... -e FACE_DETECTOR=scrfd_10g ...
+```
+
+**It does not change face embeddings by itself.** The recognition model is unchanged, so your existing face clusters are not invalidated and Immich needs no re-index.
+
+**But it will detect more faces**, which is the point of using it — and that is user-visible: Immich will find new faces in already-scanned photos and cluster them, so expect new people to appear and some existing people to gain photos. Re-running Immich's face detection job over the library is what surfaces that.
+
+> **Switching detectors invalidates the golden face reference.** A different detector finds different faces at slightly different boxes, so the crops differ and so do the ArcFace embeddings — the face count may change too. References are keyed by CLIP backend *and* detector, so an unseen combination **skips** with an explicit message rather than failing. Run `./tests/golden.sh generate` after switching. See [Golden embedding test](#golden-embedding-test).
+
+If the selected HEF is missing, the worker **refuses to start** and names the file and its download URL. Face detection is a core task; a worker running without it would answer every request with zero faces and no error.
 
 ### Detection caps
 

@@ -12,6 +12,14 @@ import os
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
+class ConfigError(RuntimeError):
+    """A configuration value is unusable.
+
+    Raised at startup so the container fails visibly instead of running with
+    something other than what was asked for.
+    """
+
+
 MODELS_DIR = os.environ.get("MODELS_DIR", "/app/models")
 CLIP_BACKEND = os.environ.get("CLIP_BACKEND", "tinyclip").lower()
 
@@ -91,11 +99,10 @@ HAILO_BATCH_SIZE_OCR = _batch_for("HAILO_BATCH_SIZE_OCR", HAILO_BATCH_SIZE)
 
 @dataclass
 class ScrfdConfig:
-    """Face detection model config.
+    """Face detection model config for one SCRFD variant.
 
-    Default: scrfd_2.5g (76.4 mAP, 1058 FPS on Hailo-8)
-    Alternative: scrfd_10g (82.1 mAP, 440 FPS) — higher accuracy, lower throughput.
-      To use: download scrfd_10g.hef, inspect with hef_inspect.py, update output_layers.
+    Built by scrfd_config_for(); do not instantiate directly unless you are
+    adding a variant. See SCRFD_VARIANTS below.
     """
     hef: str = "scrfd_2.5g.hef"
     input_size: int = 640
@@ -115,6 +122,81 @@ class ScrfdConfig:
     # a silent cap would just move the surprise somewhere harder to find.
     max_pre_nms: int = 1000   # highest-scoring candidates kept before NMS
     max_faces: int = 100      # faces returned after NMS
+
+
+# ── SCRFD variants ────────────────────────────────────────────────────
+#
+# Selected by the FACE_DETECTOR env var. Both HEFs ship, so switching is a
+# container restart.
+#
+# **The output layer names are per-variant and are NOT interchangeable.** They
+# were read from each HEF with `python3 -m ml_target.hef_inspect`, never
+# inferred. Compare the two below: stride 16 happens to be identical
+# (conv49/conv50), but strides 8 and 32 are shifted by one. Copying 2.5g's
+# names onto 10g would silently match only the stride-16 pair, so the detector
+# would find mid-size faces and quietly miss everything large or small —
+# decode_scrfd logs a warning only when *nothing* matches, not when some do.
+# That is why these live per model rather than in one shared list.
+#
+# Identifying them yourself: channel count says what a stream is (2 = class,
+# 8 = bbox, 20 = keypoints, unused), spatial size says the stride (80x80 = 8,
+# 40x40 = 16, 20x20 = 32 at this 640x640 input). See the README's Hailo-8L
+# section, which walks through the same procedure.
+#
+# Both variants' class outputs carry qp_scale 1/255, so the dequantized values
+# are already sigmoid probabilities and decode_scrfd needs no per-variant score
+# handling. The HEFs are natively UINT8; we request FLOAT32 and let HailoRT
+# dequantize.
+#
+# Latencies are `hailortcli benchmark` on a production Hailo-8, HailoRT 4.24.0.
+
+SCRFD_VARIANTS = {
+    "scrfd_2.5g": {
+        "hef": "scrfd_2.5g.hef",
+        "map": 76.4,
+        "latency_ms": 2.53,
+        "layers": [
+            (8, "scrfd_2_5g/conv42", "scrfd_2_5g/conv43"),
+            (16, "scrfd_2_5g/conv49", "scrfd_2_5g/conv50"),
+            (32, "scrfd_2_5g/conv55", "scrfd_2_5g/conv56"),
+        ],
+    },
+    "scrfd_10g": {
+        "hef": "scrfd_10g.hef",
+        "map": 82.1,
+        "latency_ms": 4.40,
+        "layers": [
+            (8, "scrfd_10g/conv41", "scrfd_10g/conv42"),
+            (16, "scrfd_10g/conv49", "scrfd_10g/conv50"),
+            (32, "scrfd_10g/conv56", "scrfd_10g/conv57"),
+        ],
+    },
+}
+
+# Which detector to load. Named for the task rather than the model family, so a
+# future non-SCRFD detector does not need a new variable — the same reasoning
+# that makes CLIP_BACKEND the right name for tinyclip/siglip.
+FACE_DETECTOR = os.environ.get("FACE_DETECTOR", "scrfd_2.5g").strip().lower()
+
+MODEL_ZOO_BASE = "https://hailo-model-zoo.s3.eu-west-2.amazonaws.com/ModelZoo/Compiled/v2.17.0/hailo8"
+
+
+def scrfd_config_for(name: str) -> ScrfdConfig:
+    """Build the ScrfdConfig for a named variant.
+
+    Raises rather than falling back. Silently loading a detector other than the
+    one asked for is exactly the class of surprise this project keeps finding —
+    and here it would degrade detection quality with nothing in the logs.
+    """
+    variant = SCRFD_VARIANTS.get(name)
+    if variant is None:
+        raise ConfigError(
+            f"FACE_DETECTOR={name!r} is not a known face detector.\n"
+            f"  Valid values: {', '.join(sorted(SCRFD_VARIANTS))}\n"
+            f"  Refusing to fall back to a different detector than requested."
+        )
+    # Fresh list per instance — the registry entry must not be shared or mutated.
+    return ScrfdConfig(hef=variant["hef"], output_layers=list(variant["layers"]))
 
 
 @dataclass
@@ -263,7 +345,8 @@ class PipelineConfig:
     quant_from_hef: bool = CLIP_QUANT_SOURCE != "config"
 
     # Face detection / recognition
-    scrfd: ScrfdConfig = field(default_factory=ScrfdConfig)
+    face_detector: str = FACE_DETECTOR
+    scrfd: ScrfdConfig = field(default_factory=lambda: scrfd_config_for(FACE_DETECTOR))
     arcface: ArcfaceConfig = field(default_factory=ArcfaceConfig)
 
     # CLIP — TinyCLIP config (used when clip_backend == "tinyclip")

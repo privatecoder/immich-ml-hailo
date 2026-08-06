@@ -55,6 +55,9 @@ class HailoModel:
     # case callers fall back to the constants in config.py.
     input_quant: Optional[QuantParams] = None
     output_quant: Optional[QuantParams] = None
+    # Device batch size actually configured, or None if left at HailoRT's
+    # default. Callers size their infer() calls from this.
+    batch_size: Optional[int] = None
 
 
 def configure_model(
@@ -63,14 +66,21 @@ def configure_model(
     *,
     input_format: Optional[hpf.FormatType] = None,
     output_format: hpf.FormatType = hpf.FormatType.FLOAT32,
+    batch_size: Optional[int] = None,
 ) -> HailoModel:
-    """Load a HEF and configure it on the given VDevice."""
+    """Load a HEF and configure it on the given VDevice.
+
+    `batch_size` sets how many frames the device processes per batch. Pass None
+    to leave HailoRT's default in place. Only worth setting for models that
+    actually receive multi-frame input.
+    """
     hef = hpf.HEF(hef_path)
 
     if input_format is None:
         input_format = _guess_input_format(hef)
 
     cfg = hpf.ConfigureParams.create_from_hef(hef, interface=hpf.HailoStreamInterface.PCIe)
+    applied_batch = _apply_batch_size(cfg, batch_size, hef_path)
     ng = vdevice.configure(hef, cfg)[0]
 
     in_params = hpf.InputVStreamParams.make_from_network_group(ng, format_type=input_format)
@@ -89,6 +99,7 @@ def configure_model(
     LOG.info("  in_key=%s  out_keys=%s", in_key, list(out_params.keys()))
     LOG.info("  in_format=%s  out_format=%s", input_format, output_format)
     LOG.info("  in_quant=%s  out_quant=%s", _fmt_quant(input_quant), _fmt_quant(output_quant))
+    LOG.info("  batch_size=%s", applied_batch if applied_batch else "<HailoRT default>")
 
     return HailoModel(
         name=name,
@@ -101,7 +112,55 @@ def configure_model(
         output_format=output_format,
         input_quant=input_quant,
         output_quant=output_quant,
+        batch_size=applied_batch,
     )
+
+
+def _apply_batch_size(
+    cfg_params: Any, batch_size: Optional[int], hef_path: str
+) -> Optional[int]:
+    """Set batch_size on every network group in the configure params.
+
+    Where this belongs is not a guess. Per the HailoRT 4.23.0 API reference,
+    batch_size is a member of `hailo_configure_network_group_params_t` — which
+    is what `ConfigureParams.create_from_hef()` returns, keyed by network-group
+    name. The vstream params have no such field: `InputVStreamParams` /
+    `OutputVStreamParams.make_from_network_group()` accept only
+    `format_type`, `timeout_ms`, `queue_size` and `network_name`.
+
+    The reference also warns against setting both the network-group batch size
+    and the per-network one (`hailo_network_parameters_t.batch_size`) — "Not
+    both". We want one value for the whole group, so the network-group
+    parameter is the documented choice and the per-network one is left alone.
+
+    Caveat worth knowing: the reference notes that the network-group batch_size
+    "is only used in multi-context network_groups". For a single-context HEF
+    this is accepted and ignored. `hailortcli parse-hef <model>.hef` reports the
+    context count if a model shows no improvement.
+
+    Returns the value actually applied, or None.
+    """
+    if not batch_size or batch_size < 1:
+        return None
+
+    applied = None
+    try:
+        names = list(cfg_params)
+    except Exception as exc:
+        LOG.warning("batch_size: cannot enumerate configure params for %s: %s", hef_path, exc)
+        return None
+
+    for name in names:
+        try:
+            cfg_params[name].batch_size = batch_size
+            applied = batch_size
+        except Exception as exc:
+            LOG.warning(
+                "batch_size: could not set %d on network group %r of %s: %s "
+                "— leaving HailoRT's default",
+                batch_size, name, hef_path, exc,
+            )
+    return applied
 
 
 def _read_quant(info: Any) -> Optional[QuantParams]:

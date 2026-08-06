@@ -12,3 +12,7 @@ hailo-rt-4/*
 !hailo-rt-4/.gitkeep
 models/*
 !models/.gitkeep
+
+# Golden embedding references — specific to one HEF build on one device,
+# generated per deployment by tests/golden.sh. Never publishable.
+tests/golden/

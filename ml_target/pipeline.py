@@ -5,7 +5,9 @@ import logging
 import math
 import os
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Any, Dict, Generator, List, Optional, Tuple
 
 import numpy as np
 import hailo_platform as hpf
@@ -35,6 +37,15 @@ from ml_target.tokenizer import SiglipTokenizer, SimpleTokenizer
 LOG = logging.getLogger("ml_target.pipeline")
 
 _PIPE = None
+
+
+class BadRequest(ValueError):
+    """The caller sent something malformed — a 400, not a worker fault.
+
+    Distinct from the ValueErrors raised deeper in the pipeline for unexpected
+    model output, which are genuine 500s and must not be reported as the
+    client's fault.
+    """
 
 # Relative tolerance for treating a HEF-read quant param as equal to the
 # config constant. The constants are stored at full float repr, so a genuine
@@ -93,19 +104,140 @@ def _resolve_quant(
     return hef_quant.qp_scale, hef_quant.qp_zp
 
 
+# ── Per-request tracing ──────────────────────────────────────────────
+#
+# Every stage timer feeds one structured INFO line per request instead of the
+# ten-odd scattered INFO lines this used to emit. Detail stays available at
+# DEBUG via LOG_LEVEL.
+#
+# A ContextVar rather than a global: today `predict` is `async def` doing
+# synchronous work, so requests are serialised on the event loop and a plain
+# global would be fine. ContextVar keeps this correct if that ever changes to a
+# threadpool handler, which is the natural next step.
+
+REQ_LOG = logging.getLogger("ml_target.request")
+
+_TRACE: "ContextVar[Optional[_RequestTrace]]" = ContextVar("ml_target_trace", default=None)
+
+
+class _RequestTrace:
+    """Timings and facts accumulated over one /predict call."""
+
+    def __init__(self) -> None:
+        self.ms: Dict[str, float] = {}
+        self.facts: Dict[str, Any] = {}
+        self.total_ms: float = 0.0
+
+    def add_ms(self, stage: str, dt: float) -> None:
+        # Accumulate: a stage entered repeatedly (per-chunk OCR recognition,
+        # for instance) reports its total, not just the last occurrence.
+        self.ms[stage] = self.ms.get(stage, 0.0) + dt
+
+    def note(self, **facts: Any) -> None:
+        self.facts.update(facts)
+
+    def format(self) -> str:
+        parts = [f"{k}={v}" for k, v in self.facts.items()]
+        parts += [f"{k}={v:.1f}ms" for k, v in self.ms.items()]
+        parts.append(f"total={self.total_ms:.1f}ms")
+        return " ".join(parts)
+
+
+def note(**facts: Any) -> None:
+    """Record facts on the current request trace, if one is active."""
+    tr = _TRACE.get()
+    if tr is not None:
+        tr.note(**facts)
+
+
+@contextmanager
+def request_trace() -> Generator["_RequestTrace", None, None]:
+    """Collect timings for one request and emit a single summary line.
+
+    Logs on every exit path — including early returns and exceptions — so a
+    request always leaves exactly one trace line behind.
+    """
+    tr = _RequestTrace()
+    token = _TRACE.set(tr)
+    t0 = time.perf_counter()
+    try:
+        yield tr
+    finally:
+        tr.total_ms = (time.perf_counter() - t0) * 1000.0
+        _TRACE.reset(token)
+        REQ_LOG.info("/predict %s", tr.format())
+
+
 class _Timer:
     def __init__(self, name: str):
         self.name = name
         self.t0 = 0.0
 
     def __enter__(self):
-        self.t0 = time.time()
-        LOG.debug("[TIMER START] %s", self.name)
+        self.t0 = time.perf_counter()
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        dt = (time.time() - self.t0) * 1000.0
-        LOG.debug("[TIMER END] %s: %.2f ms", self.name, dt)
+        dt = (time.perf_counter() - self.t0) * 1000.0
+        LOG.debug("[TIMER] %s: %.2f ms", self.name, dt)
+        tr = _TRACE.get()
+        if tr is not None:
+            tr.add_ms(self.name, dt)
+
+
+# Public alias — app.py times image decoding with it.
+stage = _Timer
+
+
+def _aligned_chunk(host_cap: int, batch_size: int) -> int:
+    """Frames per infer() call: the largest multiple of the device batch that
+    fits under the host cap.
+
+    So every full chunk is a whole number of device batches. The last chunk of a
+    run is whatever is left over and may be shorter — unavoidable, since the
+    number of faces or text regions in a photo is not ours to choose.
+
+    Because the step is a whole number of batches, every chunk except the last
+    needs no padding at all. Only the final chunk of a request can be short, so
+    the padding overhead is bounded by (batch_size - 1) frames per request
+    rather than per chunk.
+    """
+    step = (host_cap // batch_size) * batch_size
+    return step if step >= batch_size else batch_size
+
+
+def _pad_to_batch(batch: np.ndarray, batch_size: Optional[int]) -> Tuple[np.ndarray, int]:
+    """Pad a batch up to a whole multiple of batch_size.
+
+    Required, not optional: this device runs multi-context HEFs *without* the
+    model scheduler, and HailoRT rejects anything else outright —
+
+        CHECK failed - On the case of multi-context without the model scheduler,
+        frames count must be a multiplier of the batch size! (5 % 8 != 0)
+
+    Returns (padded_batch, n_real). **The caller must slice results to
+    [:n_real] before using them.** Padded rows carry no meaning and must never
+    reach an output list.
+
+    Padding repeats the last real frame rather than using zeros. Both cost the
+    same device time, but a repeated real frame is guaranteed to be in the same
+    numeric range as the genuine input, so the filler cannot stray into an
+    unusual code path. This assumes rows in a batch are independent — true for
+    these models, whose inference graphs contain no operation that reduces
+    across the batch axis (batch-norm uses fixed statistics at inference). If
+    that assumption were ever wrong, the pad content would perturb real rows and
+    the golden test would catch it.
+    """
+    n = int(batch.shape[0])
+    if not batch_size or batch_size < 1 or n == 0:
+        return batch, n
+    remainder = n % batch_size
+    if remainder == 0:
+        return batch, n
+    pad = batch_size - remainder
+    filler = np.repeat(batch[-1:], pad, axis=0)
+    LOG.debug("padding batch %d -> %d for device batch_size=%d", n, n + pad, batch_size)
+    return np.ascontiguousarray(np.concatenate([batch, filler], axis=0)), n
 
 
 class Pipeline:
@@ -121,12 +253,19 @@ class Pipeline:
             output_format=hpf.FormatType.FLOAT32,
         )
 
-        # Face recognition
+        # Face recognition — one of only two models that ever receives more
+        # than one frame, so one of only two worth giving a device batch size.
+        LOG.info(
+            "Hailo device batch size: face=%s ocr=%s",
+            cfg.face_batch_size or "<not configured>",
+            cfg.ocr_batch_size or "<not configured>",
+        )
         self.rec = configure_model(
             self.vdevice,
             cfg.hef_path(cfg.arcface.hef),
             input_format=hpf.FormatType.UINT8,
             output_format=hpf.FormatType.FLOAT32,
+            batch_size=cfg.face_batch_size,
         )
 
         # CLIP backend selection
@@ -244,6 +383,7 @@ class Pipeline:
                 ocr_rec_path,
                 input_format=hpf.FormatType.UINT8,
                 output_format=hpf.FormatType.FLOAT32,
+                batch_size=cfg.ocr_batch_size,
             )
             self.ctc_decoder = CTCDecoder(
                 char_dict_path,
@@ -288,8 +428,17 @@ def run_inference(
         if image_rgb.ndim != 3 or image_rgb.shape[2] != 3:
             raise ValueError(f"image_rgb must be HWC RGB, got {image_rgb.shape}")
         H0, W0 = image_rgb.shape[:2]
+        note(image=f"{W0}x{H0}")
     else:
         H0, W0 = 0, 0
+
+    if not isinstance(entries, dict):
+        raise BadRequest(
+            f"entries must be a JSON object mapping task name to config, "
+            f"got {type(entries).__name__}"
+        )
+
+    note(tasks=",".join(entries.keys()) or "-")
 
     for task_name, task_cfg in entries.items():
 
@@ -315,6 +464,9 @@ def run_inference(
             continue
 
         # ── Unknown task ──────────────────────────────────────────
+        # Degrade per-task rather than failing the request: a ModelTask added
+        # by a future Immich release should not take the whole worker down.
+        LOG.warning("unsupported task in entries: %r", task_name)
         resp[task_name] = {"error": f"unsupported task: {task_name}"}
 
     return resp
@@ -335,7 +487,7 @@ def _run_facial_recognition(
     min_score = float(det_opts.get("minScore", 0.7))
     iou_thr = float(det_opts.get("iouThreshold", 0.4))
 
-    LOG.info("FACEREC: H=%d W=%d min_score=%.3f iou_thr=%.3f", H0, W0, min_score, iou_thr)
+    LOG.debug("FACEREC: H=%d W=%d min_score=%.3f iou_thr=%.3f", H0, W0, min_score, iou_thr)
 
     # Detection
     input_size = cfg.scrfd.input_size
@@ -346,19 +498,21 @@ def _run_facial_recognition(
     with _Timer("det_infer"):
         det_out = infer_single(_PIPE.det, xb)
 
-    dets = decode_scrfd(
-        det_out,
-        score_thr=min_score,
-        iou_thr=iou_thr,
-        scale=scale,
-        pad_x=pad_x,
-        pad_y=pad_y,
-        orig_w=W0,
-        orig_h=H0,
-        scrfd_cfg=cfg.scrfd,
-    )
+    with _Timer("det_decode"):
+        dets = decode_scrfd(
+            det_out,
+            score_thr=min_score,
+            iou_thr=iou_thr,
+            scale=scale,
+            pad_x=pad_x,
+            pad_y=pad_y,
+            orig_w=W0,
+            orig_h=H0,
+            scrfd_cfg=cfg.scrfd,
+        )
 
-    LOG.info("FACEREC: detections=%d", len(dets))
+    LOG.debug("FACEREC: detections=%d", len(dets))
+    note(faces=len(dets))
 
     faces: List[Dict[str, Any]] = []
 
@@ -372,19 +526,49 @@ def _run_facial_recognition(
                 for d in dets
             ]
 
-        # Batch recognition in a single activation
+        # Recognition, batched in a single activation.
+        #
+        # patches[i] was built from dets[i], and dets is in descending score
+        # order out of NMS. Chunks are contiguous slices processed in order and
+        # the results concatenated in the same order, so emb_all[i] stays the
+        # embedding of dets[i] — each face keeps its own bounding box.
+        def _to_batch(group: List[np.ndarray]) -> np.ndarray:
+            if _PIPE.rec.input_format == hpf.FormatType.UINT8:
+                b = np.stack(group, axis=0).astype(np.uint8)
+            else:
+                b = np.stack([
+                    ((p.astype(np.float32) / 255.0) - 0.5) / 0.5 for p in group
+                ], axis=0).astype(np.float32)
+            return np.ascontiguousarray(b)
+
+        rec_batch = _PIPE.rec.batch_size
+        # No device batch configured: one call with everything, exactly as before.
+        step = _aligned_chunk(cfg.arcface.rec_chunk_size, rec_batch) if rec_batch else len(patches)
+
         with _Timer("rec_infer_batch"):
             with activate_model(_PIPE.rec) as rec_infer:
-                if _PIPE.rec.input_format == hpf.FormatType.UINT8:
-                    batch = np.stack(patches, axis=0).astype(np.uint8)
-                else:
-                    batch = np.stack([
-                        ((p.astype(np.float32) / 255.0) - 0.5) / 0.5 for p in patches
-                    ], axis=0).astype(np.float32)
-                batch = np.ascontiguousarray(batch)
-                rec_out = rec_infer(batch)
+                parts: List[np.ndarray] = []
+                for start in range(0, len(patches), step):
+                    group = patches[start : start + step]
+                    xb, n_real = _pad_to_batch(_to_batch(group), rec_batch)
+                    rec_out = rec_infer(xb)
+                    part = np.asarray(pick_output(rec_out, hint="fc1"), dtype=np.float32)
+                    if part.ndim > 2:
+                        part = part.reshape(part.shape[0], -1)
+                    # Discard padded rows here, at the boundary, before this
+                    # array is appended to anything. Nothing downstream ever
+                    # sees a padded row.
+                    parts.append(part[:n_real])
 
-        emb_all = np.asarray(pick_output(rec_out, hint="fc1"), dtype=np.float32)
+        emb_all = parts[0] if len(parts) == 1 else np.concatenate(parts, axis=0)
+
+        if emb_all.shape[0] != len(dets):
+            # Refuse to guess: attaching the wrong embedding to a bounding box
+            # would corrupt Immich's face clusters silently.
+            raise ValueError(
+                f"face recognition returned {emb_all.shape[0]} embeddings for "
+                f"{len(dets)} detections — refusing to pair them"
+            )
 
         for i, d in enumerate(dets):
             x1, y1, x2, y2 = d["box"]
@@ -425,7 +609,8 @@ def _run_clip(
         if not text:
             return {"clip": {"error": "missing text"}}
 
-        LOG.info("CLIP TEXT [%s]: len=%d", _PIPE.clip_backend, len(text))
+        LOG.debug("CLIP TEXT [%s]: len=%d", _PIPE.clip_backend, len(text))
+        note(backend=_PIPE.clip_backend, clip="textual")
 
         if is_siglip:
             tc = cfg.siglip_text
@@ -484,11 +669,13 @@ def _run_clip(
     if image_rgb is None:
         return {"clip": {"error": "missing image"}}
 
-    LOG.info("CLIP IMAGE [%s]: H=%d W=%d", _PIPE.clip_backend, H0, W0)
+    LOG.debug("CLIP IMAGE [%s]: H=%d W=%d", _PIPE.clip_backend, H0, W0)
+    note(backend=_PIPE.clip_backend, clip="visual")
 
     if is_siglip:
         sc = cfg.siglip_image
-        xb = prep_siglip_image(image_rgb, sc.crop_size)
+        with _Timer("clip_preprocess"):
+            xb = prep_siglip_image(image_rgb, sc.crop_size)
 
         with _Timer("clip_image_infer"):
             clip_out = infer_single(_PIPE.clip_img, xb)
@@ -502,7 +689,8 @@ def _run_clip(
 
     else:  # tinyclip
         sc = cfg.tinyclip_image
-        xb = prep_tinyclip_image(image_rgb, sc.crop_size, _PIPE.clip_img.input_format)
+        with _Timer("clip_preprocess"):
+            xb = prep_tinyclip_image(image_rgb, sc.crop_size, _PIPE.clip_img.input_format)
 
         with _Timer("clip_image_infer"):
             clip_out = infer_single(_PIPE.clip_img, xb)
@@ -537,7 +725,7 @@ def _run_ocr(
     min_det_score = float(det_opts.get("minScore", cfg.ocr_detection.box_thresh))
     min_rec_score = float(rec_opts.get("minScore", 0.9))
 
-    LOG.info("OCR: H=%d W=%d min_det_score=%.3f min_rec_score=%.3f", H0, W0, min_det_score, min_rec_score)
+    LOG.debug("OCR: H=%d W=%d min_det_score=%.3f min_rec_score=%.3f", H0, W0, min_det_score, min_rec_score)
 
     det_cfg = cfg.ocr_detection
     rec_cfg = cfg.ocr_recognition
@@ -572,60 +760,106 @@ def _run_ocr(
     )
 
     # letterbox_rgb uses uniform scaling, so scale_x == scale_y == scale
-    text_regions = decode_db_detection(
-        prob_map,
-        cfg=det_cfg_override,
-        scale_x=scale,
-        scale_y=scale,
-        pad_x=pad_x,
-        pad_y=pad_y,
-        orig_w=W0,
-        orig_h=H0,
-    )
+    with _Timer("ocr_det_decode"):
+        text_regions = decode_db_detection(
+            prob_map,
+            cfg=det_cfg_override,
+            scale_x=scale,
+            scale_y=scale,
+            pad_x=pad_x,
+            pad_y=pad_y,
+            orig_w=W0,
+            orig_h=H0,
+        )
 
-    LOG.info("OCR: %d text regions detected", len(text_regions))
+    LOG.debug("OCR: %d text regions detected", len(text_regions))
 
     if not text_regions:
+        note(ocr="0/0")
         return {"ocr": {"text": [], "box": [], "boxScore": [], "textScore": []},
                 "imageHeight": int(H0), "imageWidth": int(W0)}
 
-    # ── Step 2: Recognition — crop each text region and run through recognizer ──
+    # ── Step 2: Recognition — crop every text region, recognize in batches ──
+    #
+    # These four lists stay index-aligned: text[i], boxScore[i] and textScore[i]
+    # describe one region, and box[8i:8i+8] are that region's four corners.
+    # Nothing is appended to any of them unless all four are appended together.
     texts: List[str] = []
     boxes: List[float] = []
     box_scores: List[float] = []
     text_scores: List[float] = []
 
+    # crops[i] corresponds to text_regions[i] — built in order, nothing filtered,
+    # so a crop's list index is its region's index for the rest of this function.
+    with _Timer("ocr_crop"):
+        crops = [
+            crop_text_region(
+                image_rgb,
+                region["box"],
+                target_h=rec_cfg.input_h,
+                target_w=rec_cfg.input_w,
+            )
+            for region in text_regions
+        ]
+
+    # Host chunk, aligned down to a whole number of device batches when one is
+    # configured. The chunking structure below — and with it the index
+    # alignment — is unchanged; only the step size moves.
+    ocr_batch = _PIPE.ocr_rec.batch_size
+    chunk_size = max(1, int(rec_cfg.rec_batch_size))
+    if ocr_batch:
+        chunk_size = _aligned_chunk(chunk_size, ocr_batch)
+
     with _Timer("ocr_rec_batch"):
         with activate_model(_PIPE.ocr_rec) as rec_infer:
-            for region in text_regions:
-                crop = crop_text_region(
-                    image_rgb,
-                    region["box"],
-                    target_h=rec_cfg.input_h,
-                    target_w=rec_cfg.input_w,
-                )
-                crop_batch = np.ascontiguousarray(crop[None, ...], dtype=np.uint8)
+            for start in range(0, len(crops), chunk_size):
+                chunk = crops[start : start + chunk_size]
+                batch = np.ascontiguousarray(np.stack(chunk, axis=0), dtype=np.uint8)
+                batch, n_real = _pad_to_batch(batch, ocr_batch)
 
-                rec_out = rec_infer(crop_batch)
-                logits = np.asarray(pick_output(rec_out), dtype=np.float32).squeeze()
+                rec_out = rec_infer(batch)
+                logits = np.asarray(pick_output(rec_out), dtype=np.float32)
 
-                # CTC decode
-                if logits.ndim == 1:
+                # Normalize to (N, T, C). Do NOT squeeze() — a chunk of one
+                # would lose its batch axis and silently shift every index.
+                if logits.ndim > 3:
+                    logits = logits.reshape(logits.shape[0], -1, logits.shape[-1])
+                elif logits.ndim == 2:
+                    logits = logits[None, ...]
+
+                # Drop padded rows before anything else looks at this array, so
+                # the check below and the decode both see exactly the real
+                # regions. n_real == len(chunk) by construction.
+                if logits.ndim == 3:
+                    logits = logits[:n_real]
+
+                if logits.ndim != 3 or logits.shape[0] != len(chunk):
+                    # Refuse to guess which row belongs to which region: a wrong
+                    # guess would misattribute text to boxes. Drop the chunk.
+                    LOG.warning(
+                        "OCR recognition: unusable output shape %s for a batch of %d "
+                        "— skipping regions %d-%d",
+                        logits.shape, len(chunk), start, start + len(chunk) - 1,
+                    )
                     continue
-                decoded = _PIPE.ctc_decoder.decode(logits[None, ...] if logits.ndim == 2 else logits)
-                if not decoded:
-                    continue
 
-                text, confidence = decoded[0]
-                if not text or confidence < min_rec_score:
-                    continue
+                decoded = _PIPE.ctc_decoder.decode(logits)
 
-                texts.append(text)
-                boxes.extend(region["box"])
-                box_scores.append(region["score"])
-                text_scores.append(confidence)
+                # decoded[j] is row j of this chunk, which is crops[start + j],
+                # which is text_regions[start + j]. Resolve the region first,
+                # then filter — so a rejected region contributes to none of the
+                # four lists and the alignment above is preserved.
+                for j, (text, confidence) in enumerate(decoded):
+                    if not text or confidence < min_rec_score:
+                        continue
+                    region = text_regions[start + j]
+                    texts.append(text)
+                    boxes.extend(region["box"])
+                    box_scores.append(region["score"])
+                    text_scores.append(confidence)
 
-    LOG.info("OCR: %d text regions recognized (of %d detected)", len(texts), len(text_regions))
+    LOG.debug("OCR: %d text regions recognized (of %d detected)", len(texts), len(text_regions))
+    note(ocr=f"{len(texts)}/{len(text_regions)}")
 
     return {
         "ocr": {

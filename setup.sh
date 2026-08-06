@@ -236,6 +236,37 @@ if [[ ! -f "$TEST_IMAGE" ]]; then
     exit 0
 fi
 
+# Containers started by this script, removed on ANY exit.
+#
+# Without this, a failing test suite tripped `set -e` before the cleanup line
+# below could run, leaving a container bound to port 3003. The next run then
+# died with "port is already allocated" — a confusing second failure masking
+# the first. The trap covers every exit path: test failure, Ctrl-C, or a fault
+# anywhere else in the script.
+TEST_CONTAINERS=()
+
+cleanup_test_containers() {
+    local c
+    for c in ${TEST_CONTAINERS[@]+"${TEST_CONTAINERS[@]}"}; do
+        docker rm -f "$c" >/dev/null 2>&1 || true
+    done
+}
+trap cleanup_test_containers EXIT
+
+# Wait until nothing holds port 3003. `docker rm -f` returns before the port is
+# actually released, which is the other half of "port is already allocated".
+wait_for_port_free() {
+    local i
+    for i in $(seq 1 30); do
+        if [[ -z "$(docker ps -q --filter "publish=3003" 2>/dev/null || true)" ]]; then
+            sleep 1   # brief settle for the port to be released by the daemon
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
 run_test_with_backend() {
     local backend="$1"
     local container="immich-ml-setup-test-${backend}-$$"
@@ -247,8 +278,10 @@ run_test_with_backend() {
     EXISTING=$(docker ps -q --filter "publish=3003" 2>/dev/null || true)
     if [[ -n "$EXISTING" ]]; then
         docker rm -f "$EXISTING" >/dev/null 2>&1 || true
-        sleep 2
+        wait_for_port_free || echo "  $(yellow 'WARNING'): port 3003 still held; starting anyway"
     fi
+
+    TEST_CONTAINERS+=("$container")
 
     if ! docker run -d \
         --device=/dev/hailo0:/dev/hailo0 \
@@ -294,15 +327,23 @@ except:
     echo ""
     docker cp "$SCRIPT_DIR/tests/test.sh" "$container:/tmp/test.sh"
     docker cp "$TEST_IMAGE" "$container:/tmp/test_image.jpg"
-    docker exec "$container" bash /tmp/test.sh /tmp/test_image.jpg
-    local result=$?
+    # `|| result=$?` keeps `set -e` from aborting here — the removal below must
+    # run whether the suite passed or failed.
+    local result=0
+    docker exec "$container" bash /tmp/test.sh /tmp/test_image.jpg || result=$?
 
     docker rm -f "$container" >/dev/null 2>&1 || true
-    return $result
+    return "$result"
 }
 
-run_test_with_backend "tinyclip"
-run_test_with_backend "siglip"
+# `if !` so a failure is reported rather than silently aborting via set -e.
+# The EXIT trap still removes the container either way.
+if ! run_test_with_backend "tinyclip"; then
+    fail "test suite failed for CLIP_BACKEND=tinyclip"
+fi
+if ! run_test_with_backend "siglip"; then
+    fail "test suite failed for CLIP_BACKEND=siglip"
+fi
 
 echo ""
 bold "Setup complete. All tests passed."; echo ""

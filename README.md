@@ -24,16 +24,24 @@ Two CLIP backends are available, selectable via the `CLIP_BACKEND` environment v
 |--|-------------------|--------|
 | Image input | 224x224 (center-crop) | 224x224 (squash resize) |
 | Embedding dim | 512 | 768 |
-| Image FPS | ~60 | ~14 |
-| Text FPS | ~18 | ~17 |
+| Image FPS *(vendor, device-only)* | ~60 | ~14 |
+| Text FPS *(vendor, device-only)* | ~18 | ~17 |
 | Search quality | Good | Better |
 | Immich model match | None | `ViT-B-16-SigLIP__webli` |
+
+> **The FPS rows are Hailo's device-only benchmark figures, and they are not what this worker delivers per request.** They measure the accelerator running a saturated stream; a `/predict` call also pays activation, virtual-stream setup and the host-side transfer for a single frame.
+>
+> Measured on a Hailo-8: SigLIP `clip_image_infer` is **224 ms per call**, about **4.5 FPS** — roughly a third of the vendor figure. The comparison between the two backends still holds (TinyCLIP is substantially faster than SigLIP); the absolute numbers do not.
+>
+> Both are true and neither should be read as the other. Use the vendor row to compare models, and the measured number to predict how long a library scan takes.
 
 **TinyCLIP** is significantly faster (~4x for images) but produces embeddings incompatible with any Immich default model.
 
 **SigLIP** produces the same embeddings as Immich's `ViT-B-16-SigLIP__webli` (same underlying Google model weights). This means you can switch between this Hailo worker and the official Immich ML worker **without re-running Smart Search** — the embeddings are compatible. The text encoder output is also simpler: already pooled to a single vector (no CPU-side projection needed).
 
 The two backends come off the device differently. **TinyCLIP** outputs FLOAT32 directly — no dequantization step. **SigLIP** outputs UINT16 and is dequantized to float32 using per-model quantization parameters (`output_qp_scale` / `output_qp_zp` in `config.py`). Both are L2-normalized before being returned.
+
+See [MODELS.md](MODELS.md) for why each model was chosen, which alternatives were evaluated (and rejected), and what a future upgrade path looks like.
 
 ## Prerequisites
 
@@ -429,6 +437,67 @@ The suite targets `http://localhost:3003` by default. Override with `BASE_URL` t
 BASE_URL=http://192.168.1.50:3003 ./tests/test.sh tests/test.jpg
 ```
 
+### Golden embedding test
+
+`test.sh` asserts embedding *dimensions*. `tests/golden.sh` asserts embedding *values*, against a reference captured from a build you trust.
+
+This exists because the dangerous failure mode is a **correctly-shaped, correctly-normalised, subtly-wrong vector** — wrong quantization parameters, a mis-shaped batch, a silently substituted model. Every one of `test.sh`'s assertions passes in that case. Only comparing against a known-good reference catches it. Run it before and after any change to how tensors reach the device.
+
+Run it on the Docker host, against a running container:
+
+```bash
+# Capture references from a build you trust (do this once, deliberately)
+./tests/golden.sh generate
+
+# Verify nothing has drifted
+./tests/golden.sh check
+```
+
+`generate` runs the same image ten times first, reports the observed run-to-run cosine spread, and sets the pass threshold at ten times that measured noise floor (never tighter than `1e-5`). The measurement is printed so the number is auditable:
+
+```
+  measured run-to-run cosine similarity:
+    clip_visual    min=1.000000000000  dim=768  n=10
+    clip_textual   min=1.000000000000  dim=768  n=10
+    face           min=1.000000000000  dim=512  n=10
+
+  Device is bit-exact across repeats (all similarities == 1.0).
+  Threshold set to 0.999990000 (margin 1.000e-05 = 10x observed, floor 1e-5)
+```
+
+It covers CLIP visual, CLIP textual, and the ArcFace face embedding, plus the detected face count.
+
+> **⚠️ References are not portable, and must be regenerated deliberately.**
+>
+> They pin the numeric output of one HEF build on one device. A Hailo-8 reference will not match a Hailo-8L, and a Model Zoo version bump recompiles the HEF and moves the values. **Regenerate whenever the model, the HEF version, or the device changes** — and never merely to make the test pass, which discards the only signal you have.
+>
+> A stale reference fails with a large similarity drop that looks exactly like a regression. The checker warns when the container image tag or the test image has changed since the reference was captured, but it cannot detect every case.
+
+References live in `tests/golden/` (gitignored, one file per CLIP backend) and are **not** shipped in the repo — generate them on your own deployment. `check` skips cleanly with instructions when no reference exists, so it is safe to run on a fresh install. Run `generate` once per backend you use.
+
+Environment: `BASE_URL`, `CONTAINER`, `GOLDEN_DIR`, and `SAMPLES` (repeats used to measure the noise floor, default 10).
+
+### Benchmarking
+
+`scripts/benchmark.sh` reports **per-stage** p50/p95 latency, so a change can be attributed to a specific pipeline stage rather than to an end-to-end total:
+
+```bash
+./scripts/benchmark.sh                      # tests/test.jpg, 20 iterations
+./scripts/benchmark.sh /path/to/img.jpg 50  # custom image, 50 iterations
+```
+
+It fires requests for all four task shapes (CLIP visual, CLIP textual, facial recognition, OCR), then reads the timings back out of the worker's per-request summary lines via `docker logs`. That means it needs no code change and no rebuild — it measures the container you already have running. It is read-only: it sends inference requests and reads logs, and never restarts or reconfigures anything.
+
+Run it on the Docker host, with `LOG_LEVEL` at `INFO` or `DEBUG` (it aborts otherwise, since a higher level suppresses the lines it parses).
+
+**Pause Immich's ML jobs first.** Concurrent traffic both competes for the device and writes into the same log; the script warns when it sees more matching lines than it sent, which means the numbers are contaminated.
+
+To compare two runs, keep the image, iteration count and backend identical — face and OCR timings scale with how many faces and text regions the image happens to contain.
+
+**Record the batch settings with every run.** `HAILO_BATCH_SIZE_FACE` and `HAILO_BATCH_SIZE_OCR` change `rec_infer_batch` and `ocr_rec_batch` by a factor of several, so two runs are only comparable if both are known. The script prints the container's resolved image tag and backend but cannot see these, since they take effect at model-configure time — note them yourself alongside the results.
+
+This is a tool you reach for deliberately. It is not part of `setup.sh`.
+
 ## Debugging
 
 Run on the **host**:
@@ -440,6 +509,22 @@ docker logs -f immich-ml-hailo
 # Open an interactive shell inside the container
 docker exec -it immich-ml-hailo /bin/bash
 ```
+
+### Reading the request log
+
+At the default `INFO` level each `/predict` call emits one summary line:
+
+```
+2026-08-06 11:20:04 - INFO - /predict image=1920x1080 tasks=clip backend=siglip clip=visual status=200 decode_image=18.4ms clip_preprocess=2.9ms clip_image_infer=71.2ms total=94.1ms
+2026-08-06 11:20:05 - INFO - /predict image=1920x1080 tasks=facial-recognition faces=3 status=200 decode_image=17.9ms letterbox=11.6ms det_infer=24.8ms det_decode=6.1ms crop_faces=1.4ms rec_infer_batch=19.7ms total=82.6ms
+2026-08-06 11:20:07 - INFO - /predict image=1920x1080 tasks=ocr ocr=12/15 status=200 decode_image=18.1ms ocr_letterbox=14.2ms ocr_det_infer=38.5ms ocr_det_decode=9.3ms ocr_crop=3.7ms ocr_rec_batch=64.9ms total=149.8ms
+```
+
+Facts come first, then per-stage timings, then the end-to-end total. `faces=` is the detection count; `ocr=12/15` means 12 of 15 detected regions passed the recognition score threshold. Stage names map directly onto pipeline steps, so a slow stage is immediately attributable. Every request produces one such summary line, including failures — a request that fails outright carries `status=400`/`status=500` and an `error=` tag.
+
+A request can produce **additional** `WARNING`/`ERROR` lines alongside its summary — a detection cap triggering, an unknown task, SCRFD layer names not matching, an unusable OCR output shape, or a malformed request. Those are deliberately not suppressed at `INFO`: they are the lines you need. Note also that per-task errors returned inside a `200` response (missing image or text, OCR models unavailable) are reported in the response body and do not add an `error=` tag to the summary.
+
+Set `LOG_LEVEL=DEBUG` for the underlying per-call detail (letterbox geometry, SCRFD decode parameters, per-timer lines, the full `entries` payload). That is useful for one-off diagnosis and far too verbose for a library scan — a 50,000-asset scan at `INFO` writes roughly 50,000 lines rather than 500,000, which matters on Unraid where `docker.img` space is finite.
 
 Run **inside the container** — either from that shell, or prefixed with `docker exec immich-ml-hailo`:
 
@@ -453,7 +538,7 @@ python3 -m ml_target.inspect_models
 
 ## Project Structure
 
-The repository is 25 files and a few hundred kilobytes. **`models/` and `hailo-rt-4/` ship containing nothing but a `.gitkeep`** — every model, weight file, and runtime package is downloaded from its original source or generated on your machine at setup time. None of it is redistributed here, which is both why the repo is small and why `setup.sh` exists.
+The repository is 28 files and a few hundred kilobytes. **`models/` and `hailo-rt-4/` ship containing nothing but a `.gitkeep`** — every model, weight file, and runtime package is downloaded from its original source or generated on your machine at setup time. None of it is redistributed here, which is both why the repo is small and why `setup.sh` exists.
 
 ```
 .dockerignore             # Shared build context exclusions for both Dockerfiles
@@ -461,6 +546,7 @@ The repository is 25 files and a few hundred kilobytes. **`models/` and `hailo-r
 Dockerfile.hailo-base     # Base image: Ubuntu 24.04 + HailoRT
 Dockerfile.immich-ml-hailo # App image: FastAPI + models + inference code
 LICENSE                   # MIT
+MODELS.md                 # Model choices, evaluated alternatives, upgrade paths
 README.md
 setup.sh                  # Full setup: check prereqs, download models, build, test
 hailo-rt-4/
@@ -484,9 +570,12 @@ ml_target/                # Application code
 scripts/
   extract_tinyclip_weights.sh  # Generate tinyclip_text_weights.npz from checkpoint
   extract_siglip_weights.sh    # Generate siglip_text_weights.npz + spiece.model
+  benchmark.sh                 # Per-stage p50/p95 latency against a running container
 tests/
   test.sh                 # End-to-end test suite (19 assertions / 18 without OCR)
+  golden.sh               # Golden-embedding regression test (generate | check)
   test.jpg                # Sample test image
+  golden/                 # Generated references — gitignored, per device and HEF build
 ```
 
 ## Configuration
@@ -500,6 +589,55 @@ Environment variables:
 | `CLIP_BACKEND` | `tinyclip` | `tinyclip` or `siglip` — see [CLIP Backend Choice](#clip-backend-choice) |
 | `MODELS_DIR` | `/app/models` | Where the pipeline looks for HEFs and supporting files |
 | `CLIP_QUANT_SOURCE` | `hef` | `hef` reads CLIP quantization parameters from the loaded HEF, falling back to the `config.py` constants when the runtime does not expose them. `config` forces the constants. Only change this if the startup log reports a quantization mismatch on hardware you know was working. |
+| `LOG_LEVEL` | `INFO` | Logging verbosity — `DEBUG`, `INFO`, `WARNING`, `ERROR`. At `INFO` each request emits one summary line; `DEBUG` adds the per-stage detail. Read at startup, so changing it needs a container restart but no rebuild. Case-insensitive and whitespace-tolerant. An unrecognized non-empty value falls back to `INFO` and logs a warning; setting it to an empty value is treated as unset and falls back silently. |
+| `HAILO_BATCH_SIZE_FACE` | `8` | Device batch size for ArcFace face recognition. `default` disables device batching on this path. |
+| `HAILO_BATCH_SIZE_OCR` | `8` | Device batch size for OCR text recognition. `default` disables device batching on this path. |
+| `HAILO_BATCH_SIZE` | `8` | Fallback for both of the above. A per-path variable always wins — including when it is set to `default`. |
+
+All three are read at startup, so **changing them is a container restart, not a rebuild.**
+
+### Device batching
+
+`8` is the measured optimum on a Hailo-8, not a guess — see [MODELS.md](MODELS.md) for the measurements and the cost model behind them. In short: batching face recognition at 8 is **2.2× faster** across a typical mix of photos, because the dominant cost is a fixed per-burst overhead that batching amortises, not per-frame compute.
+
+It applies only to the two paths that ever receive more than one frame — face recognition and OCR recognition. CLIP and both detection models are sent exactly one frame per request and are left at HailoRT's default.
+
+Frames are padded up to a whole multiple of the batch size, because this device runs multi-context HEFs without the model scheduler and HailoRT rejects any other frame count:
+
+```
+CHECK failed - On the case of multi-context without the model scheduler,
+frames count must be a multiplier of the batch size! (5 % 8 != 0)
+```
+
+Padding is cheap here precisely because the overhead is per burst — a burst costs about the same whether it carries one real frame or eight. Padded rows are discarded before any result is assembled.
+
+The one case where batching loses is a photo with exactly **one** face: 28.8 ms → 35.2 ms. That is roughly 3% of a request whose total is ~205 ms, and it is repaid from two faces upward. If your library is overwhelmingly single-face portraits, `HAILO_BATCH_SIZE_FACE=default` reverts that path — but measure before assuming it helps.
+
+`ScrfdConfig.max_faces` (default 100) bounds the recognition batch: at batch 8 that is at most 13 bursts for a single image.
+
+### Detection caps
+
+`ScrfdConfig` in `config.py` bounds how much work one image can create:
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `max_pre_nms` | `1000` | Highest-scoring candidate boxes kept before NMS |
+| `max_faces` | `100` | Faces returned after NMS |
+
+SCRFD emits 16,800 candidate boxes for a 640×640 input. Immich's **minimum detection score** is an admin-facing slider: at its default of 0.7 almost none survive, but at a low value thousands can — and every survivor costs an NMS iteration and then a 112×112 crop in a single stacked recognition batch. These caps keep that bounded.
+
+Neither cap has any effect at normal thresholds. When one does truncate it logs at `WARNING` with the counts, so it is never silent:
+
+```
+WARNING SCRFD decode: 16626 candidates above score_thr=0.100 exceeds max_pre_nms=1000 —
+        keeping the 1000 highest-scoring. ...
+WARNING SCRFD decode: 625 faces after NMS exceeds max_faces=100 —
+        returning the 100 highest-scoring. ...
+```
+
+If you see these, the usual cause is a minimum detection score set too low in Immich. Raise it, or raise the cap in `config.py` if the image genuinely contains that many faces.
+
+`OcrRecognitionConfig.rec_batch_size` (default `32`) controls how many detected text regions are recognized per device round-trip.
 
 ## License
 

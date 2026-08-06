@@ -51,7 +51,7 @@ def decode_scrfd(
     Uses layer names from scrfd_cfg.output_layers so the decoder works
     with any SCRFD variant (2.5g, 10g, etc.) without code changes.
     """
-    LOG.info(
+    LOG.debug(
         "SCRFD decode: score_thr=%.3f iou_thr=%.3f scale=%.6f pad=(%d,%d) orig=(%d,%d)",
         score_thr, iou_thr, scale, pad_x, pad_y, orig_w, orig_h,
     )
@@ -108,11 +108,26 @@ def decode_scrfd(
         all_scores.append(scores[keep_mask])
 
     if not all_boxes:
-        LOG.info("SCRFD decode: no boxes passed score_thr=%.3f", score_thr)
+        LOG.debug("SCRFD decode: no boxes passed score_thr=%.3f", score_thr)
         return []
 
     boxes_lb = np.concatenate(all_boxes, axis=0)
     scores = np.concatenate(all_scores, axis=0)
+
+    # Cap candidates before NMS. SCRFD emits 16,800 boxes at 640x640; a low
+    # minScore can pass thousands, and NMS is a Python loop whose iteration
+    # count tracks the survivor count. Truncating by score is safe — NMS would
+    # discard low scorers anyway — but it is never silent.
+    if scores.size > scrfd_cfg.max_pre_nms:
+        LOG.warning(
+            "SCRFD decode: %d candidates above score_thr=%.3f exceeds max_pre_nms=%d — "
+            "keeping the %d highest-scoring. A low minScore produces many candidates; "
+            "raise it, or raise ScrfdConfig.max_pre_nms if this is expected.",
+            scores.size, score_thr, scrfd_cfg.max_pre_nms, scrfd_cfg.max_pre_nms,
+        )
+        top = np.argpartition(-scores, scrfd_cfg.max_pre_nms)[: scrfd_cfg.max_pre_nms]
+        boxes_lb = boxes_lb[top]
+        scores = scores[top]
 
     boxes_lb[:, [0, 2]] -= float(pad_x)
     boxes_lb[:, [1, 3]] -= float(pad_y)
@@ -124,10 +139,23 @@ def decode_scrfd(
     boxes_orig[:, 3] = np.clip(boxes_orig[:, 3], 0, orig_h - 1)
 
     keep_idx = nms_xyxy(boxes_orig, scores, iou_thr)
+
+    # Cap faces after NMS. Every survivor becomes a 112x112 ArcFace crop in one
+    # stacked batch, so this bounds recognition memory as well as response size.
+    # nms_xyxy walks boxes in descending score order, so keep_idx is already
+    # score-ordered and the head of the list is the highest-scoring faces.
+    if len(keep_idx) > scrfd_cfg.max_faces:
+        LOG.warning(
+            "SCRFD decode: %d faces after NMS exceeds max_faces=%d — returning the %d "
+            "highest-scoring. Raise ScrfdConfig.max_faces if genuinely needed.",
+            len(keep_idx), scrfd_cfg.max_faces, scrfd_cfg.max_faces,
+        )
+        keep_idx = keep_idx[: scrfd_cfg.max_faces]
+
     dets: List[Dict[str, Any]] = []
     for i in keep_idx:
         x1, y1, x2, y2 = boxes_orig[i].tolist()
         dets.append({"box": [x1, y1, x2, y2], "score": float(scores[i])})
 
-    LOG.info("SCRFD decode: after NMS keep=%d", len(dets))
+    LOG.debug("SCRFD decode: after NMS keep=%d", len(dets))
     return dets

@@ -48,7 +48,7 @@ def letterbox_rgb(
     pad_y = (new_h - rh) // 2
     out[pad_y : pad_y + rh, pad_x : pad_x + rw] = resized
 
-    LOG.info(
+    LOG.debug(
         "letterbox: orig=(%d,%d) new=(%d,%d) scale=%.6f pad=(%d,%d)",
         w, h, new_w, new_h, scale, pad_x, pad_y,
     )

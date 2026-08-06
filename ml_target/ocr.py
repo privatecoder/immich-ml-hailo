@@ -88,7 +88,7 @@ def decode_db_detection(
             "score": float(score),
         })
 
-    LOG.info("DBNet decode: %d text regions (from %d contours)", len(results), len(contours))
+    LOG.debug("DBNet decode: %d text regions (from %d contours)", len(results), len(contours))
     return results
 
 

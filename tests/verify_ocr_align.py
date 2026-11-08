@@ -54,6 +54,15 @@ def main():
     texts, boxes = ocr["text"], ocr["box"]
     box_scores, text_scores = ocr["boxScore"], ocr["textScore"]
     n = len(texts)
+    # Responses for Immich use 0-1 boxes. Older captures are pixels.
+    # Scale fractions back with the reported image size before cell math.
+    width = int(resp.get("imageWidth") or W)
+    height = int(resp.get("imageHeight") or H)
+    if boxes and width > 1 and height > 1 and max(float(v) for v in boxes) <= 1.0:
+        boxes = [
+            float(v) * (width if i % 2 == 0 else height)
+            for i, v in enumerate(boxes)
+        ]
 
     print(f"regions returned: {n}   (image contains {ROWS * COLS})")
 

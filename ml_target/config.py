@@ -309,6 +309,41 @@ ARCFACE_VARIANTS = {
 # Which recognition model to load. Task-named to match FACE_DETECTOR.
 FACE_RECOGNIZER = os.environ.get("FACE_RECOGNIZER", "arcface_r50").strip().lower()
 
+# Space of the quad copied into the OCR HTTP response.
+#
+#   "pixels"      (default) — image pixels, which is what this worker has
+#                             always returned. An update therefore does not
+#                             move highlights a client already stored.
+#   "normalized"            — x divided by width, y divided by height. That
+#                             is the space Immich stores. Detection and the
+#                             recognition crop stay in pixels either way.
+#
+# Read at startup. Switching is a container restart, not a rebuild.
+_OCR_BOX_SPACES = ("pixels", "normalized")
+
+
+def parse_ocr_box_space(raw: Optional[str]) -> str:
+    """Return a known OCR box space, or raise ConfigError.
+
+    None and blank mean the default, pixels. Anything else must be named
+    explicitly. Falling back would put boxes in a different space than the
+    one the operator asked for.
+    """
+    if raw is None or not str(raw).strip():
+        return "pixels"
+    value = str(raw).strip().lower()
+    if value not in _OCR_BOX_SPACES:
+        raise ConfigError(
+            f"OCR_BOX_SPACE={raw!r} is not a known OCR box space.\n"
+            f"  Valid values: {', '.join(_OCR_BOX_SPACES)}\n"
+            f"  Refusing to fall back: the wrong space places highlights\n"
+            f"  off the text they belong to."
+        )
+    return value
+
+
+OCR_BOX_SPACE = parse_ocr_box_space(os.environ.get("OCR_BOX_SPACE"))
+
 
 def arcface_config_for(name: str) -> ArcfaceConfig:
     """Build the ArcfaceConfig for a named variant. Raises on an unknown name.
@@ -489,15 +524,18 @@ class PipelineConfig:
     # OCR
     ocr_detection: OcrDetectionConfig = field(default_factory=OcrDetectionConfig)
     ocr_recognition: OcrRecognitionConfig = field(default_factory=OcrRecognitionConfig)
+    # "pixels" (default) or "normalized". See OCR_BOX_SPACE above.
+    ocr_box_space: str = OCR_BOX_SPACE
 
     def __post_init__(self) -> None:
         # Resolve the selectable models from their selector strings. Also where
-        # an unknown FACE_DETECTOR / FACE_RECOGNIZER raises, so a bad value
-        # fails at construction rather than at first inference.
+        # an unknown FACE_DETECTOR / FACE_RECOGNIZER / OCR_BOX_SPACE raises, so
+        # a bad value fails at construction rather than at first inference.
         if self.scrfd is None:
             self.scrfd = scrfd_config_for(self.face_detector)
         if self.arcface is None:
             self.arcface = arcface_config_for(self.face_recognizer)
+        self.ocr_box_space = parse_ocr_box_space(self.ocr_box_space)
 
     def hef_path(self, filename: str) -> str:
         return os.path.join(self.models_dir, filename)

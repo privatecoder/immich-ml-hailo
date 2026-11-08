@@ -591,6 +591,7 @@ ml_target/                # Application code
   preprocessing.py        # Image transforms, CLIP preprocessing, L2 normalize
   decoders.py             # SCRFD face detection post-processing + NMS
   ocr.py                  # PaddleOCR DBNet post-processing + CTC decode
+  ocr_coords.py           # Response box space: pixels (default) or 0-1
   tokenizer.py            # CLIP BPE + SigLIP SentencePiece tokenizers
   hailo_backend.py        # Back-compat shim; re-exports init_pipeline / run_inference
   hef_inspect.py          # Utility: print one HEF's input/output stream info
@@ -607,6 +608,7 @@ tests/
   ocr-align.jpg           # 64-cell position-encoding grid for OCR alignment checks
   ocr-align.svg           # Source the grid was rendered from
   verify_ocr_align.py     # Asserts text[i] names the cell box[i] sits in
+  test_normalize_ocr_box.py  # Box-space contract; no device and no OpenCV
   golden/                 # Generated references — gitignored, per device, backend, detector and recognizer
 ```
 
@@ -629,8 +631,11 @@ Environment variables:
 | `REQUEST_MODE` | `serial` | `serial` runs one request at a time; `threadpool` overlaps host CPU work with device time. See [Request handling](#request-handling). Opt-in — reverting is a restart. |
 | `REQUEST_THREADS` | `4` | Worker threads when `REQUEST_MODE=threadpool`. Measured optimum; 8 buys +3% for double the peak memory. |
 | `FACE_RECOGNIZER` | `arcface_r50` | Face recognition model — `arcface_r50` or `arcface_mobilefacenet`. **Changing this forces Immich to re-run its face jobs.** See [Face recognition model](#face-recognition-model). An unrecognised value fails at startup. |
+| `OCR_BOX_SPACE` | `pixels` | `pixels` returns each OCR quad in image pixels, which is what this worker has always returned. `normalized` divides x by width and y by height, the space Immich stores. Detection and the recognition crop stay in pixels either way. An unrecognised value fails at startup. Switching is a restart, not a rebuild. |
 
 All three are read at startup, so **changing them is a container restart, not a rebuild.**
+
+`OCR_BOX_SPACE` is the same kind of switch. The image you already built keeps returning pixel quads until you set `OCR_BOX_SPACE=normalized` and restart. Use `normalized` when the client stores each corner as a fraction of the image, which is what Immich does. Leaving the default alone means pulling an update does not move OCR highlights that were already stored.
 
 ### Device batching
 

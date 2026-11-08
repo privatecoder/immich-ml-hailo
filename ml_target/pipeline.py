@@ -38,7 +38,7 @@ from ml_target.preprocessing import (
     prep_tinyclip_image,
 )
 from ml_target.ocr import CTCDecoder, crop_text_region, decode_db_detection
-from ml_target.ocr_coords import normalize_ocr_box
+from ml_target.ocr_coords import box_for_response
 from ml_target.tokenizer import SiglipTokenizer, SimpleTokenizer
 
 LOG = logging.getLogger("ml_target.pipeline")
@@ -884,8 +884,9 @@ def _run_ocr(
     #
     # These four lists stay index-aligned: text[i], boxScore[i] and textScore[i]
     # describe one region, and box[8i:8i+8] are that region's four corners.
-    # Corners in the response are 0-1 image fractions. The crops above still
-    # use the pixel quad from detection.
+    # Corners in the response follow cfg.ocr_box_space. The default, pixels,
+    # is the quad detection returned. "normalized" scales that copy into the
+    # 0-1 space Immich stores. The crops above always use the pixel quad.
     # Nothing is appended to any of them unless all four are appended together.
     texts: List[str] = []
     boxes: List[float] = []
@@ -957,7 +958,11 @@ def _run_ocr(
                         continue
                     region = text_regions[start + j]
                     texts.append(text)
-                    boxes.extend(normalize_ocr_box(region["box"], W0, H0))
+                    boxes.extend(
+                        box_for_response(
+                            region["box"], W0, H0, cfg.ocr_box_space
+                        )
+                    )
                     box_scores.append(region["score"])
                     text_scores.append(confidence)
 
